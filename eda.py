@@ -46,7 +46,7 @@ print(missing[missing > 0])
 print("\n" + "=" * 60)
 print("DUPLICATAS")
 print("=" * 60)
-duplicatas_antes = df_clean.duplicated().sum()s
+duplicatas_antes = df_clean.duplicated().sum()
 print(f"Duplicatas encontradas: {duplicatas_antes:,}")
 if duplicatas_antes > 0:
     df_clean = df_clean.drop_duplicates()
@@ -481,8 +481,3 @@ print(PASTA_GRAFICOS)
 
 print(f"\nRelatório:")
 print(ARQUIVO_RELATORIO)
-
-print("\nPróxima etapa:")
-print("Enriquecimento dos livros usando a Google Books API.")
-```
-
