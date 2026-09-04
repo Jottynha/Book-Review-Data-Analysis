@@ -15,12 +15,12 @@ Para superar o gargalo de IDs numéricos e dados faltantes da base bruta, implem
 
 | Nível de Análise | Total de Registros | Cobertura com Metadados Externos | Taxa de Sucesso |
 | :--- | :--- | :--- | :--- |
-| **Livros Únicos** | `8.916` títulos | **`7.706` livros** enriquecidos | **86,43%** |
+| **Livros Únicos** | `8.916` títulos | **`8.145` livros** enriquecidos | **91,35%** |
 | **Avaliações (Reviews)** | `10.000` resenhas | **`10.000` resenhas** integradas | **100,00%** |
-| **Reviews com Metadados Externos** | `10.000` resenhas | **`8.767` resenhas** com dados externos | **87,67%** |
+| **Reviews com Metadados Externos** | `10.000` resenhas | **`9.216` resenhas** com dados externos | **92,16%** |
 | **Reviews com ISBN-13** | `10.000` resenhas | **`9.974` resenhas** com ISBN-13 | **99,74%** |
 
-> **Nota Metodológica:** Como os livros mais populares concentram um volume muito maior de avaliações, a taxa de enriquecimento no dataset de reviews atinge **87,67%**, com autores identificados para **mais de 99,5%** das resenhas.
+> **Nota Metodológica:** Como os livros mais populares concentram um volume muito maior de avaliações, a taxa de enriquecimento no dataset de reviews atinge **92,16%**, com autores identificados para **mais de 99,6%** de todas as resenhas.
 
 ---
 
@@ -30,18 +30,18 @@ Abaixo está o raio-x detalhado de cada atributo bibliográfico incorporado à b
 
 | Atributo | Cobertura (Livros) | Cobertura (Reviews) | Fonte Principal | Status / Observações |
 | :--- | :---: | :---: | :--- | :--- |
-| **Autor por Extenso** | `7.665` (85,97%) | **`9.953` (99,53%)** | Open Library + Google | ✅ **Resolvido** (substitui o ID numérico opaco do Goodreads) |
+| **Autor por Extenso** | `8.104` (90,89%) | **`9.960` (99,60%)** | Open Library + Google | ✅ **Resolvido** (substitui o ID numérico opaco do Goodreads) |
 | **ISBN-13 Padronizado** | `6.631` (74,37%) | **`9.974` (99,74%)** | Goodreads + OL Search | ✅ **Resolvido** (1.234 ISBNs resgatados por busca de título) |
-| **Editora Oficial** | `7.280` (81,65%) | **`9.460` (94,60%)** | Open Library + Google | ✅ **Disponível** para análises de mercado editorial |
-| **Categorias / Gêneros** | `6.750` (75,71%) | **`9.120` (91,20%)** | Open Library + Google | ✅ **Padronizado** (taxonomia bibliográfica formal vs. tags livres) |
-| **Imagem de Capa** | `6.050` (67,86%) | **`8.410` (84,10%)** | Open Library + Google | ✅ **Disponível** para dashboards e interfaces visuais |
-| **Número de Páginas** | `5.950` (66,73%) | **`8.550` (85,50%)** | Goodreads / Open Library / Google | ✅ **Disponível** para correlação com notas e leitura |
-| **Nota Open Library** | `5.050` (56,64%) | **`6.079` (60,79%)** | Open Library Ratings | 🌟 **Diferencial** para estudo comparativo de plataformas |
-| **Status Comercial / E-book** | ~320 (3,59%) | ~380 (3,80%) | Google Books Play Store | ✅ **Integrado** (via fallback do Google Books com API key) |
+| **Título Validado** | `8.142` (91,32%) | **`9.213` (92,13%)** | Open Library + Google | ✅ **Padronizado** (títulos oficiais sem subtítulos ruidosos) |
+| **Editora Oficial** | `7.720` (86,59%) | **`9.580` (95,80%)** | Open Library + Google | ✅ **Disponível** para análises de mercado editorial |
+| **Categorias / Gêneros** | `7.180` (80,53%) | **`8.082` (80,82%)** | Open Library + Google | ✅ **Padronizado** (taxonomia bibliográfica formal vs. tags livres) |
+| **Número de Páginas** | `6.480` (72,68%) | **`7.295` (72,95%)** | Goodreads / Open Library / Google | ✅ **Disponível** para correlação com notas e leitura |
+| **Nota Open Library / Google** | `5.090` (57,09%) | **`6.123` (61,23%)** | Open Library Ratings | 🌟 **Diferencial** para estudo comparativo de plataformas |
+| **Status Comercial / E-book** | `711` (7,97%) | `795` (7,95%) | Google Books Play Store | ✅ **Integrado** (via fallback da Google Books API) |
 
 ### ⚠️ O que está Faltando e Por Quê?
-* **1.210 Livros sem Metadados Externos (13,57% dos títulos únicos):**
-  * Correspondem a capítulos avulsos do Kindle, fanzines, quadrinhos serializados (*single issues*), obras autopublicadas ou edições raras que não possuem cadastro no catálogo bibliográfico internacional da Open Library nem na Google Books API.
+* **Apenas 771 Livros sem Metadados Externos (8,65% dos títulos únicos):**
+  * Correspondem a capítulos avulsos do Kindle, fanzines, quadrinhos serializados (*single issues*), fanfics do AO3 ou edições raras que não possuem registro bibliográfico em bibliotecas nem no Google Play Livros.
   * No entanto, esses títulos **não comprometem as análises**, pois o Goodreads já preserva suas notas originais, resenhas de texto e contagem de votos.
 
 ---
@@ -85,7 +85,7 @@ Book-Review-Data-Analysis/
 │   ├── goodreads_books_100k.parquet            # Base bruta dos 8.916 livros únicos da amostra
 │   ├── goodreads_reviews_100k.parquet          # Amostra de 10.000 avaliações do Goodreads
 │   ├── goodreads_reviews_with_books_100k.parquet # Join inicial Goodreads (Reviews + Books)
-│   ├── google_books_100k.parquet               # Tabela consolidada dos 7.706 livros enriquecidos
+│   ├── google_books_100k.parquet               # Tabela consolidada dos 8.145 livros enriquecidos
 │   ├── goodreads_reviews_google_books_100k.parquet # DATASET FINAL: 10.000 reviews × 62 colunas
 │   └── google_books_cache.json                 # Cache JSON persistido para reprodutibilidade
 ├── 01_amostra_reviews.py                       # Script de amostragem (Reservoir Sampling)

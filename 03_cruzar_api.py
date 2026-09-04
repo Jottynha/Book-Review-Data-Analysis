@@ -447,7 +447,7 @@ def validar_candidato(gr_title, gr_year, gr_publisher, doc):
 # FUNÇÕES DE BUSCA: GOOGLE BOOKS API
 # ============================================================
 
-def requisicao_google_books(query, api_key=None):
+def requisicao_google_books(query, api_key=None, max_retries=4):
     parametros = {
         "q": query,
         "maxResults": MAX_RESULTADOS,
@@ -456,24 +456,34 @@ def requisicao_google_books(query, api_key=None):
     if api_key:
         parametros["key"] = api_key
 
-    try:
-        resp = requests.get(GOOGLE_BOOKS_URL, params=parametros, timeout=TIMEOUT)
-        if resp.status_code == 200:
-            return {"status": "success", "data": resp.json()}
-        elif resp.status_code == 429:
-            return {"status": "rate_limit", "error": "HTTP 429"}
-        else:
-            return {"status": "error", "code": resp.status_code, "error": resp.text[:200]}
-    except Exception as e:
-        return {"status": "exception", "error": str(e)}
+    delay = 1.0
+    for tentativa in range(max_retries):
+        try:
+            resp = requests.get(GOOGLE_BOOKS_URL, params=parametros, timeout=TIMEOUT)
+            if resp.status_code == 200:
+                return {"status": "success", "data": resp.json()}
+            elif resp.status_code == 429:
+                texto_erro = resp.text
+                if "Queries per day" in texto_erro:
+                    return {"status": "daily_quota_exceeded", "error": texto_erro}
+                # Burst rate limit (QPS) passageiro: aguarda e tenta novamente
+                time.sleep(delay)
+                delay = min(delay * 2, 6.0)
+                continue
+            else:
+                return {"status": "error", "code": resp.status_code, "error": resp.text[:200]}
+        except Exception:
+            time.sleep(delay)
+            delay = min(delay * 2, 6.0)
+
+    return {"status": "burst_rate_limit", "error": "Limite de rajada excedido após retentativas"}
 
 
 def buscar_livro_google(row, api_key=None):
     """
     Busca um livro no Google Books usando estratégias em cascata:
-    1. ISBN-13
-    2. ISBN-10
-    3. Título com validação cruzada anti-homônimo
+    1. ISBN-13 ou ISBN-10
+    2. Título com validação cruzada anti-homônimo
     """
     b_id = str(row["book_id"]).strip()
     isbn13 = limpar_valor(row.get("isbn13", ""))
@@ -485,15 +495,15 @@ def buscar_livro_google(row, api_key=None):
     isbn_busca = isbn13 or isbn
     if isbn_busca:
         res = requisicao_google_books(f"isbn:{isbn_busca}", api_key=api_key)
-        if res.get("status") == "rate_limit":
+        if res.get("status") == "daily_quota_exceeded":
             return None, True
         if res.get("status") == "success" and res["data"].get("items"):
             return extrair_volume_google(res["data"]["items"][0], "google_isbn", b_id), False
 
-    # 3. Busca por Título com validação
+    # 2. Busca por Título com validação
     if titulo_limpo:
         res = requisicao_google_books(f'intitle:"{titulo_limpo}"', api_key=api_key)
-        if res.get("status") == "rate_limit":
+        if res.get("status") == "daily_quota_exceeded":
             return None, True
         if res.get("status") == "success" and res["data"].get("items"):
             itens = res["data"]["items"]
@@ -516,7 +526,7 @@ def buscar_livro_google(row, api_key=None):
                     maior_score = sc
                     melhor_item = it
 
-            if melhor_item and maior_score >= THRESHOLD_VALIDACAO:
+            if melhor_item and maior_score >= 40:
                 return extrair_volume_google(melhor_item, f"google_title_score_{maior_score}", b_id), False
 
     return None, False
@@ -906,9 +916,10 @@ else:
         vol, rate_limited = buscar_livro_google(row, api_key=API_KEY)
         if rate_limited:
             rate_limit_atingido = True
+        time.sleep(0.05)
         return b_id, vol, rate_limited
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
         futures = {executor.submit(processar_livro_google, row): row for row in livros_pendentes_google}
         for i, fut in enumerate(concurrent.futures.as_completed(futures)):
             try:
@@ -916,7 +927,7 @@ else:
                 if rate_limited and rate_limit_atingido:
                     print("\n\n" + "!" * 70)
                     print("[AVISO] GOOGLE BOOKS API RETORNOU HTTP 429 (QUOTA DIÁRIA EXCEDIDA)")
-                    print("A cota diária da chave de API no Google Cloud foi atingida.")
+                    print("A cota diária de 1.000 requisições da chave no Google Cloud foi atingida.")
                     print("!" * 70 + "\n")
                     for f in futures:
                         f.cancel()
