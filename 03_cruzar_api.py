@@ -25,6 +25,25 @@ BASE_DIR = Path(__file__).resolve().parent
 PASTA_PROJETO = Path(os.getenv("PASTA_PROJETO", str(BASE_DIR)))
 PASTA_PROCESSED = PASTA_PROJETO / "processed"
 
+# Carregar variáveis de ambiente de arquivo .env local se existir
+ENV_FILE = BASE_DIR / ".env"
+if ENV_FILE.exists():
+    try:
+        with open(ENV_FILE, "r", encoding="utf-8-sig") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    k = k.lstrip("\ufeff").strip()
+                    v = v.strip().strip('"').strip("'")
+                    if k and k not in os.environ:
+                        os.environ[k] = v
+    except Exception:
+        pass
+
+# Flags de linha de comando
+SKIP_OPENLIBRARY = "--skip-openlibrary" in sys.argv or "--only-google" in sys.argv
+
 # Arquivos de entrada
 ARQUIVO_BOOKS = PASTA_PROCESSED / "goodreads_books_100k.parquet"
 ARQUIVO_REVIEWS = PASTA_PROCESSED / "goodreads_reviews_100k.parquet"
@@ -425,6 +444,85 @@ def validar_candidato(gr_title, gr_year, gr_publisher, doc):
 
 
 # ============================================================
+# FUNÇÕES DE BUSCA: GOOGLE BOOKS API
+# ============================================================
+
+def requisicao_google_books(query, api_key=None):
+    parametros = {
+        "q": query,
+        "maxResults": MAX_RESULTADOS,
+        "printType": "books",
+    }
+    if api_key:
+        parametros["key"] = api_key
+
+    try:
+        resp = requests.get(GOOGLE_BOOKS_URL, params=parametros, timeout=TIMEOUT)
+        if resp.status_code == 200:
+            return {"status": "success", "data": resp.json()}
+        elif resp.status_code == 429:
+            return {"status": "rate_limit", "error": "HTTP 429"}
+        else:
+            return {"status": "error", "code": resp.status_code, "error": resp.text[:200]}
+    except Exception as e:
+        return {"status": "exception", "error": str(e)}
+
+
+def buscar_livro_google(row, api_key=None):
+    """
+    Busca um livro no Google Books usando estratégias em cascata:
+    1. ISBN-13
+    2. ISBN-10
+    3. Título com validação cruzada anti-homônimo
+    """
+    b_id = str(row["book_id"]).strip()
+    isbn13 = limpar_valor(row.get("isbn13", ""))
+    isbn = limpar_valor(row.get("isbn", ""))
+    titulo = limpar_valor(row.get("title_without_series", "")) or limpar_valor(row.get("title", ""))
+    titulo_limpo = limpar_titulo(titulo)
+
+    # 1. Busca por ISBN (prioriza ISBN-13, senão ISBN-10)
+    isbn_busca = isbn13 or isbn
+    if isbn_busca:
+        res = requisicao_google_books(f"isbn:{isbn_busca}", api_key=api_key)
+        if res.get("status") == "rate_limit":
+            return None, True
+        if res.get("status") == "success" and res["data"].get("items"):
+            return extrair_volume_google(res["data"]["items"][0], "google_isbn", b_id), False
+
+    # 3. Busca por Título com validação
+    if titulo_limpo:
+        res = requisicao_google_books(f'intitle:"{titulo_limpo}"', api_key=api_key)
+        if res.get("status") == "rate_limit":
+            return None, True
+        if res.get("status") == "success" and res["data"].get("items"):
+            itens = res["data"]["items"]
+            gr_year = limpar_valor(row.get("publication_year", ""))
+            gr_pub = limpar_valor(row.get("publisher", ""))
+            melhor_item = None
+            maior_score = 0
+            for it in itens:
+                v_info = it.get("volumeInfo", {})
+                pub_date = v_info.get("publishedDate", "")
+                ano_cand = pub_date[:4] if len(pub_date) >= 4 and pub_date[:4].isdigit() else ""
+                editora_cand = [v_info.get("publisher", "")] if v_info.get("publisher") else []
+                doc_simulado = {
+                    "title": v_info.get("title", ""),
+                    "first_publish_year": ano_cand,
+                    "publisher": editora_cand
+                }
+                sc = validar_candidato(titulo_limpo, gr_year, gr_pub, doc_simulado)
+                if sc > maior_score:
+                    maior_score = sc
+                    melhor_item = it
+
+            if melhor_item and maior_score >= THRESHOLD_VALIDACAO:
+                return extrair_volume_google(melhor_item, f"google_title_score_{maior_score}", b_id), False
+
+    return None, False
+
+
+# ============================================================
 # ETAPA 1: BUSCA EM LOTE NA OPEN LIBRARY (POR ISBN)
 # ============================================================
 
@@ -447,8 +545,12 @@ for _, row in df_books.iterrows():
     elif isbn:
         bibkey_to_books.setdefault(f"ISBN:{isbn}", []).append((b_id, row))
 
-todas_bibkeys = list(bibkey_to_books.keys())
-print(f"Livros pendentes com ISBN a buscar: {len(todas_bibkeys):,} chaves")
+if SKIP_OPENLIBRARY:
+    print("\n[INFO] Etapa 1 pulada (--skip-openlibrary ativo).")
+    todas_bibkeys = []
+else:
+    todas_bibkeys = list(bibkey_to_books.keys())
+    print(f"Livros pendentes com ISBN a buscar: {len(todas_bibkeys):,} chaves")
 
 encontrados_ol = 0
 if todas_bibkeys:
@@ -507,10 +609,13 @@ for _, row in df_books.iterrows():
 
     titulo_busca = limpar_valor(row.get("title_without_series", "")) or limpar_valor(row.get("title", ""))
     titulo_busca = limpar_titulo(titulo_busca)
-    if titulo_busca:
+    if titulo_busca and not SKIP_OPENLIBRARY:
         livros_para_busca_titulo.append((b_id, titulo_busca, row))
 
-print(f"Livros pendentes para busca por título: {len(livros_para_busca_titulo):,}")
+if SKIP_OPENLIBRARY:
+    print("\n[INFO] Etapa 2 pulada (--skip-openlibrary ativo).")
+else:
+    print(f"Livros pendentes para busca por título: {len(livros_para_busca_titulo):,}")
 
 encontrados_ol_search = 0
 
@@ -779,13 +884,57 @@ for _, row in df_books.iterrows():
 
 print(f"Livros ainda não enriquecidos: {len(livros_pendentes_google):,}")
 
-if not API_KEY:
-    print("\n[INFO] GOOGLE_BOOKS_API_KEY não informada. Fallback do Google Books pulado.")
-elif not livros_pendentes_google:
+encontrados_google = 0
+
+if not livros_pendentes_google:
     print("\n[INFO] Todos os livros já foram resolvidos nas etapas anteriores!")
 else:
-    print(f"Consultando Google Books para os {len(livros_pendentes_google):,} livros restantes...")
-    # (A lógica do Google Books permanece disponível caso uma chave seja configurada)
+    if not API_KEY:
+        print("\n[AVISO] GOOGLE_BOOKS_API_KEY não informada no ambiente.")
+        print("Tentando consulta pública (sujeita a cota diária do IP no Google)...")
+    else:
+        print("\n[INFO] Usando chave configurada em GOOGLE_BOOKS_API_KEY.")
+
+    pbar_google = tqdm(total=len(livros_pendentes_google), desc="Consultando Google Books")
+    rate_limit_atingido = False
+
+    def processar_livro_google(row):
+        global rate_limit_atingido
+        if rate_limit_atingido:
+            return None, None, False
+        b_id = str(row["book_id"]).strip()
+        vol, rate_limited = buscar_livro_google(row, api_key=API_KEY)
+        if rate_limited:
+            rate_limit_atingido = True
+        return b_id, vol, rate_limited
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+        futures = {executor.submit(processar_livro_google, row): row for row in livros_pendentes_google}
+        for i, fut in enumerate(concurrent.futures.as_completed(futures)):
+            try:
+                b_id, vol, rate_limited = fut.result()
+                if rate_limited and rate_limit_atingido:
+                    print("\n\n" + "!" * 70)
+                    print("[AVISO] GOOGLE BOOKS API RETORNOU HTTP 429 (QUOTA DIÁRIA EXCEDIDA)")
+                    print("A cota diária da chave de API no Google Cloud foi atingida.")
+                    print("!" * 70 + "\n")
+                    for f in futures:
+                        f.cancel()
+                    break
+                if vol:
+                    cache[b_id] = vol
+                    encontrados_google += 1
+            except Exception:
+                pass
+
+            pbar_google.update(1)
+            pbar_google.set_postfix({"Encontrados Google": encontrados_google})
+
+            if (i + 1) % 25 == 0:
+                salvar_cache(cache)
+
+    salvar_cache(cache)
+    print(f"\nEtapa Google Books concluída. Livros enriquecidos pelo Google: {encontrados_google:,}")
 
 
 # ============================================================
