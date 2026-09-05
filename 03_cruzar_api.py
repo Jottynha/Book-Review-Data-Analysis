@@ -991,49 +991,6 @@ if len(df_enriquecido_api) > 0:
         right_on="goodreads_book_id",
         how="left"
     )
-
-    # ========================================================
-    # COALESCE HÍBRIDO (UNIFICAÇÃO API + GOODREADS)
-    # ========================================================
-    print("\nAplicando Coalesce Híbrido (preenchendo lacunas da API com dados nativos do Goodreads)...")
-
-    # 1. Número de Páginas
-    paginas_api = pd.to_numeric(df_books_completo["google_page_count"], errors="coerce")
-    paginas_gr = pd.to_numeric(df_books_completo["num_pages"], errors="coerce")
-    df_books_completo["google_page_count"] = paginas_api.combine_first(paginas_gr)
-
-    # 2. Descrição / Sinopse
-    desc_api = df_books_completo["google_description"].fillna("").astype(str)
-    desc_gr = df_books_completo["description"].fillna("").astype(str)
-    df_books_completo["google_description"] = desc_api.where(desc_api.str.strip() != "", desc_gr)
-
-    # 3. Editora
-    pub_api = df_books_completo["google_publisher"].fillna("").astype(str)
-    pub_gr = df_books_completo["publisher"].fillna("").astype(str)
-    df_books_completo["google_publisher"] = pub_api.where(pub_api.str.strip() != "", pub_gr)
-
-    # 4. Ano / Data de Publicação
-    ano_api = df_books_completo["google_published_date"].fillna("").astype(str)
-    ano_gr = df_books_completo["publication_year"].fillna("").astype(str)
-    df_books_completo["google_published_date"] = ano_api.where(ano_api.str.strip() != "", ano_gr)
-
-    # 5. Título
-    tit_api = df_books_completo["google_title"].fillna("").astype(str)
-    tit_gr = df_books_completo["title"].fillna("").astype(str)
-    df_books_completo["google_title"] = tit_api.where(tit_api.str.strip() != "", tit_gr)
-
-    # 6. Identificadores ISBN
-    isbn13_api = df_books_completo["google_isbn13"].fillna("").astype(str)
-    isbn13_gr = df_books_completo["isbn13"].fillna("").astype(str)
-    df_books_completo["google_isbn13"] = isbn13_api.where(isbn13_api.str.strip() != "", isbn13_gr)
-
-    isbn10_api = df_books_completo["google_isbn10"].fillna("").astype(str)
-    isbn10_gr = df_books_completo["isbn"].fillna("").astype(str)
-    df_books_completo["google_isbn10"] = isbn10_api.where(isbn10_api.str.strip() != "", isbn10_gr)
-
-    # 7. Fonte dos metadados
-    fonte_api = df_books_completo["api_source"].fillna("").astype(str)
-    df_books_completo["api_source"] = fonte_api.where(fonte_api.str.strip() != "", "goodreads_native")
 else:
     df_books_completo = df_books.copy()
 
@@ -1073,28 +1030,18 @@ if "google_volume_id" in df_final.columns:
 taxa_livros = (total_enriquecidos / total_livros * 100) if total_livros > 0 else 0
 taxa_reviews = (reviews_com_enriquecimento / total_reviews * 100) if total_reviews > 0 else 0
 
-fontes_livros = df_books_completo["api_source"].value_counts().to_dict() if "api_source" in df_books_completo.columns else {}
-
-rev_paginas = df_final["google_page_count"].notna().sum() if "google_page_count" in df_final.columns else 0
-rev_desc = (df_final["google_description"].fillna("").str.strip() != "").sum() if "google_description" in df_final.columns else 0
-rev_autores = (df_final["google_authors"].fillna("").str.strip() != "").sum() if "google_authors" in df_final.columns else 0
-rev_titulos = (df_final["google_title"].fillna("").str.strip() != "").sum() if "google_title" in df_final.columns else 0
+fontes = df_enriquecido_api["api_source"].value_counts().to_dict() if "api_source" in df_enriquecido_api.columns else {}
 
 print()
 print("=" * 70)
-print("RESUMO DO ENRIQUECIMENTO (COM COALESCE HÍBRIDO)")
+print("RESUMO DO ENRIQUECIMENTO")
 print("=" * 70)
-print(f"Total de livros Goodreads:            {total_livros:,}")
-print(f"Livros com metadados externos (APIs):  {total_enriquecidos:,} ({taxa_livros:.2f}%)")
-print("\nDistribuição das fontes dos metadados dos livros:")
-for fonte, contagem in fontes_livros.items():
-    print(f"  - Fonte '{fonte}': {contagem:,} livros ({contagem/total_livros*100:.1f}%)")
-print(f"\nTotal de reviews:                     {total_reviews:,}")
-print(f"Reviews com metadados externos (API): {reviews_com_enriquecimento:,} ({taxa_reviews:.2f}%)")
-print(f"Reviews com Título validado:          {rev_titulos:,} ({rev_titulos/total_reviews*100:.2f}%)")
-print(f"Reviews com Autor identificado:       {rev_autores:,} ({rev_autores/total_reviews*100:.2f}%)")
-print(f"Reviews com Sinopse / Descrição:      {rev_desc:,} ({rev_desc/total_reviews*100:.2f}%)")
-print(f"Reviews com Número de Páginas:        {rev_paginas:,} ({rev_paginas/total_reviews*100:.2f}%)")
+print(f"Total de livros Goodreads:         {total_livros:,}")
+print(f"Livros enriquecidos com sucesso:    {total_enriquecidos:,} ({taxa_livros:.2f}%)")
+for fonte, contagem in fontes.items():
+    print(f"  - Fonte '{fonte}': {contagem:,} livros")
+print(f"Total de reviews:                  {total_reviews:,}")
+print(f"Reviews com metadados externos:    {reviews_com_enriquecimento:,} ({taxa_reviews:.2f}%)")
 print("=" * 70)
 print("PROCESSO CONCLUÍDO COM SUCESSO!")
 print("=" * 70)
