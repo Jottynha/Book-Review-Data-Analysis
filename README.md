@@ -24,25 +24,26 @@ Para superar o gargalo de IDs numéricos e dados faltantes da base bruta, implem
 
 ---
 
-## 🔍 O que foi Coberto vs. O que Falta
+## 🔍 Cobertura Consolidada (Coalesce Híbrido)
 
-Abaixo está o raio-x detalhado de cada atributo bibliográfico incorporado à base de dados:
+Abaixo está o raio-x de preenchimento de cada atributo bibliográfico no dataset final de 10.000 avaliações, combinando as APIs com os dados nativos do Goodreads (*Coalesce Híbrido*):
 
-| Atributo | Cobertura (Livros) | Cobertura (Reviews) | Fonte Principal | Status / Observações |
+| Atributo | Cobertura (Reviews) | Cobertura (Livros) | Fonte Consolidada | Status / Impacto na Análise |
 | :--- | :---: | :---: | :--- | :--- |
-| **Autor por Extenso** | `8.104` (90,89%) | **`9.960` (99,60%)** | Open Library + Google | ✅ **Resolvido** (substitui o ID numérico opaco do Goodreads) |
-| **ISBN-13 Padronizado** | `6.631` (74,37%) | **`9.974` (99,74%)** | Goodreads + OL Search | ✅ **Resolvido** (1.234 ISBNs resgatados por busca de título) |
-| **Título Validado** | `8.142` (91,32%) | **`9.213` (92,13%)** | Open Library + Google | ✅ **Padronizado** (títulos oficiais sem subtítulos ruidosos) |
-| **Editora Oficial** | `7.720` (86,59%) | **`9.580` (95,80%)** | Open Library + Google | ✅ **Disponível** para análises de mercado editorial |
-| **Categorias / Gêneros** | `7.180` (80,53%) | **`8.082` (80,82%)** | Open Library + Google | ✅ **Padronizado** (taxonomia bibliográfica formal vs. tags livres) |
-| **Número de Páginas** | `6.480` (72,68%) | **`7.295` (72,95%)** | Goodreads / Open Library / Google | ✅ **Disponível** para correlação com notas e leitura |
-| **Nota Open Library / Google** | `5.090` (57,09%) | **`6.123` (61,23%)** | Open Library Ratings | 🌟 **Diferencial** para estudo comparativo de plataformas |
-| **Status Comercial / E-book** | `711` (7,97%) | `795` (7,95%) | Google Books Play Store | ✅ **Integrado** (via fallback da Google Books API) |
+| **Título do Livro** | **`10.000` (100,00%)** | `8.916` (100,00%) | Open Library + Google + Goodreads | ✅ **100% Coberto** (sem nenhum título nulo) |
+| **ISBN-13 Padronizado** | **`9.974` (99,74%)** | `6.631` (74,37%) | Goodreads + OL Search | ✅ **Resolvido** (1.234 ISBNs resgatados por busca de título) |
+| **Sinopse / Descrição** | **`9.634` (96,34%)** | `8.810` (98,81%) | Google Books + Goodreads Native | ✅ **Excelente** para NLP e modelagem de tópicos |
+| **Ano / Data de Publicação** | **`9.696` (96,96%)** | `8.635` (96,85%) | Google Books + Goodreads Native | ✅ **Pronto** para séries temporais e evolução temporal |
+| **Editora Oficial** | **`9.490` (94,90%)** | `8.535` (95,73%) | Open Library + Google + Goodreads | ✅ **Disponível** para análises de mercado editorial |
+| **Número de Páginas** | **`9.482` (94,82%)** | `8.639` (96,89%) | Goodreads Native + Open Library | ✅ **Pronto** para correlação entre extensão e nota |
+| **Metadados Externos (APIs)**| **`9.216` (92,16%)** | `8.145` (91,35%) | Open Library + Google Books API | 🌟 **Riquíssimo** em identificadores de catálogo formal |
+| **Nome do Autor (Extenso)** | **`9.136` (91,36%)** | `8.104` (90,89%) | Open Library + Google Books | ✅ **Resolvido** (substitui o ID numérico opaco do Goodreads) |
+| **Nota Open Library** | **`6.149` (61,49%)** | `5.116` (57,38%) | Open Library Search Ratings | 🌟 **Diferencial** para estudo comparativo de plataformas |
+| **Status Comercial / E-book** | **`795` (7,95%)** | `711` (7,97%) | Google Play Books Store | ✅ **Integrado** (via fallback da Google Books API) |
 
-### ⚠️ O que está Faltando e Por Quê?
-* **Apenas 771 Livros sem Metadados Externos (8,65% dos títulos únicos):**
-  * Correspondem a capítulos avulsos do Kindle, fanzines, quadrinhos serializados (*single issues*), fanfics do AO3 ou edições raras que não possuem registro bibliográfico em bibliotecas nem no Google Play Livros.
-  * No entanto, esses títulos **não comprometem as análises**, pois o Goodreads já preserva suas notas originais, resenhas de texto e contagem de votos.
+### ⚠️ O que resta com Goodreads Nativo (8,65% dos títulos)?
+* Os 771 títulos restantes (que respondem por apenas 7,8% das reviews) possuem título, páginas, notas e sinopse garantidos pelo Goodreads nativo.
+* Apenas o nome textual do autor nesses 771 ainda está representado pelo `author_id` original (o que pode ser resolvido a qualquer momento com o dataset `goodreads_book_authors.json.gz`).
 
 ---
 
