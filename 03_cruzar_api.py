@@ -1,20 +1,54 @@
+"""
+03_cruzar_api.py
+
+Etapa de coleta e consolidação das fontes externas:
+
+Goodreads
+   ├── Open Library
+   └── Google Books
+
+Principais características:
+- mantém Open Library e Google Books em estruturas separadas;
+- reutiliza o cache antigo da branch openlibrary;
+- permite consultar as duas fontes para o mesmo livro;
+- usa ISBN-13/ISBN-10 antes de buscas por título;
+- salva caches independentes;
+- não considera "encontrado por uma API" como "finalizado";
+- trata HTTP 429 com Retry-After e backoff;
+- salva o cache periodicamente;
+- permite retomada após interrupção;
+- normaliza tipos antes de salvar Parquet;
+- gera uma tabela de livros enriquecida e uma tabela de reviews.
+
+Uso:
+    python3 03_cruzar_api.py
+
+Opções:
+    --skip-openlibrary
+    --skip-google
+    --only-migrate-cache
+
+Os dados desta etapa ainda NÃO são considerados matches validados.
+A validação rigorosa será feita no 04_validar_matches.py.
+"""
+
+from __future__ import annotations
+
+import concurrent.futures
+import json
 import os
+import random
+import re
 import sys
 import time
-import json
-import re
+import unicodedata
+from difflib import SequenceMatcher
 from pathlib import Path
-import concurrent.futures
-import requests
-import pandas as pd
-from tqdm import tqdm
+from typing import Any
 
-# Configura encoding do terminal Windows para suportar caracteres especiais/emojis
-if sys.platform == "win32":
-    try:
-        sys.stdout.reconfigure(encoding="utf-8")
-    except Exception:
-        pass
+import pandas as pd
+import requests
+from tqdm import tqdm
 
 
 # ============================================================
@@ -22,1026 +56,3189 @@ if sys.platform == "win32":
 # ============================================================
 
 BASE_DIR = Path(__file__).resolve().parent
-PASTA_PROJETO = Path(os.getenv("PASTA_PROJETO", str(BASE_DIR)))
-PASTA_PROCESSED = PASTA_PROJETO / "processed"
 
-# Carregar variáveis de ambiente de arquivo .env local se existir
-ENV_FILE = BASE_DIR / ".env"
-if ENV_FILE.exists():
-    try:
-        with open(ENV_FILE, "r", encoding="utf-8-sig") as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith("#") and "=" in line:
-                    k, v = line.split("=", 1)
-                    k = k.lstrip("\ufeff").strip()
-                    v = v.strip().strip('"').strip("'")
-                    if k and k not in os.environ:
-                        os.environ[k] = v
-    except Exception:
-        pass
+PASTA_PROJETO = Path(
+    os.getenv(
+        "PASTA_PROJETO",
+        str(BASE_DIR),
+    )
+)
 
-# Flags de linha de comando
-SKIP_OPENLIBRARY = "--skip-openlibrary" in sys.argv or "--only-google" in sys.argv
+PASTA_PROCESSED = (
+    PASTA_PROJETO / "processed"
+)
 
-# Arquivos de entrada
-ARQUIVO_BOOKS = PASTA_PROCESSED / "goodreads_books_100k.parquet"
-ARQUIVO_REVIEWS = PASTA_PROCESSED / "goodreads_reviews_100k.parquet"
+ARQUIVO_BOOKS = (
+    PASTA_PROCESSED
+    / "goodreads_books_100k.parquet"
+)
 
-# Arquivos de saída
-ARQUIVO_GOOGLE_BOOKS = PASTA_PROCESSED / "google_books_100k.parquet"
-ARQUIVO_FINAL = PASTA_PROCESSED / "goodreads_reviews_google_books_100k.parquet"
-ARQUIVO_CACHE = PASTA_PROCESSED / "google_books_cache.json"
+ARQUIVO_REVIEWS = (
+    PASTA_PROCESSED
+    / "goodreads_reviews_100k.parquet"
+)
 
-# Configurações Open Library API (Batch por ISBN)
-OPEN_LIBRARY_URL = "https://openlibrary.org/api/books"
-OPEN_LIBRARY_BATCH_SIZE = 50
-OPEN_LIBRARY_DELAY = 0.4
-OPEN_LIBRARY_HEADERS = {
-    "User-Agent": "Book-Review-Data-Analysis/1.0 (CEFET-MG Data Science Project; contact: aluno@cefetmg.br)"
+
+# ============================================================
+# CACHE
+# ============================================================
+
+# Cache original criado pela branch anterior.
+ARQUIVO_CACHE_ANTIGO = (
+    PASTA_PROCESSED
+    / "google_books_cache.json"
+)
+
+# Cache independente Open Library.
+ARQUIVO_CACHE_OPENLIBRARY = (
+    PASTA_PROCESSED
+    / "openlibrary_cache.json"
+)
+
+# Cache independente Google Books.
+ARQUIVO_CACHE_GOOGLE = (
+    PASTA_PROCESSED
+    / "google_books_cache_v2.json"
+)
+
+
+# ============================================================
+# SAÍDAS
+# ============================================================
+
+ARQUIVO_BOOKS_ENRIQUECIDO = (
+    PASTA_PROCESSED
+    / "goodreads_books_enriquecido_100k.parquet"
+)
+
+ARQUIVO_REVIEWS_ENRIQUECIDO = (
+    PASTA_PROCESSED
+    / "goodreads_reviews_enriquecidas_100k.parquet"
+)
+
+
+# ============================================================
+# OPEN LIBRARY
+# ============================================================
+
+OPENLIBRARY_BATCH_URL = (
+    "https://openlibrary.org/api/books"
+)
+
+OPENLIBRARY_SEARCH_URL = (
+    "https://openlibrary.org/search.json"
+)
+
+OPENLIBRARY_BATCH_SIZE = 50
+
+OPENLIBRARY_DELAY = 0.40
+
+OPENLIBRARY_SEARCH_WORKERS = 3
+
+OPENLIBRARY_SEARCH_LIMIT = 5
+
+
+# ============================================================
+# GOOGLE BOOKS
+# ============================================================
+
+GOOGLE_BOOKS_URL = (
+    "https://www.googleapis.com/books/v1/volumes"
+)
+
+GOOGLE_API_KEY = os.getenv(
+    "GOOGLE_BOOKS_API_KEY"
+)
+
+GOOGLE_DELAY = 0.50
+
+GOOGLE_TIMEOUT = 20
+
+GOOGLE_MAX_RESULTS = 5
+
+
+# ============================================================
+# RATE LIMIT / RETRY
+# ============================================================
+
+MAX_RETRIES_429 = 5
+
+BACKOFF_BASE = 2.0
+
+BACKOFF_MAX = 120.0
+
+# Pequena aleatoriedade para evitar que várias execuções
+# sincronizadas façam requisições exatamente juntas.
+BACKOFF_JITTER = 0.25
+
+
+# ============================================================
+# SEGURANÇA
+# ============================================================
+
+# Limita novas consultas por execução.
+# Use 0 para sem limite.
+
+MAX_NEW_OPENLIBRARY_BOOKS = 1000
+
+MAX_NEW_GOOGLE_BOOKS = 1000
+
+
+# ============================================================
+# CACHE / CHECKPOINT
+# ============================================================
+
+# Quantidade de matches após a qual o cache é salvo.
+CACHE_SAVE_EVERY = 25
+
+
+# ============================================================
+# FLAGS
+# ============================================================
+
+SKIP_OPENLIBRARY = (
+    "--skip-openlibrary" in sys.argv
+)
+
+SKIP_GOOGLE = (
+    "--skip-google" in sys.argv
+)
+
+ONLY_MIGRATE = (
+    "--only-migrate-cache" in sys.argv
+)
+
+
+# ============================================================
+# HEADERS
+# ============================================================
+
+OPENLIBRARY_HEADERS = {
+    "User-Agent": (
+        "Book-Review-Data-Analysis/2.0 "
+        "(academic project; CEFET-MG)"
+    )
 }
 
-# Configurações Open Library Search API (Por Título com Validação)
-OPEN_LIBRARY_SEARCH_URL = "https://openlibrary.org/search.json"
-MAX_WORKERS_SEARCH = 6  # Concorrência eficiente e respeitosa com a Open Library
-THRESHOLD_VALIDACAO = 50
 
-# Configurações Google Books API (Fallback)
-GOOGLE_BOOKS_URL = "https://www.googleapis.com/books/v1/volumes"
-API_KEY = os.getenv("GOOGLE_BOOKS_API_KEY")
-TEMPO_ENTRE_REQUISICOES_GOOGLE = 0.2
-TIMEOUT = 15
-MAX_RESULTADOS = 5
+GOOGLE_HEADERS = {
+    "User-Agent": (
+        "Book-Review-Data-Analysis/2.0 "
+        "(academic project; CEFET-MG)"
+    )
+}
 
 
 # ============================================================
-# VERIFICAÇÕES INICIAIS
+# LEITURA DE .ENV
 # ============================================================
 
-print("=" * 70)
-print("ENRIQUECIMENTO DE DADOS: OPEN LIBRARY (BATCH + SEARCH) + GOOGLE BOOKS")
-print("=" * 70)
+def carregar_env_local() -> None:
+    env_file = BASE_DIR / ".env"
 
-if not os.path.exists(ARQUIVO_BOOKS):
-    raise FileNotFoundError(f"\nArquivo de livros não encontrado:\n{ARQUIVO_BOOKS}\n")
+    if not env_file.exists():
+        return
 
-if not os.path.exists(ARQUIVO_REVIEWS):
-    raise FileNotFoundError(f"\nArquivo de reviews não encontrado:\n{ARQUIVO_REVIEWS}\n")
-
-os.makedirs(PASTA_PROCESSED, exist_ok=True)
-
-
-# ============================================================
-# GERENCIAMENTO DE CACHE
-# ============================================================
-
-def carregar_cache():
-    if not os.path.exists(ARQUIVO_CACHE):
-        return {}
     try:
-        with open(ARQUIVO_CACHE, "r", encoding="utf-8") as arquivo:
-            return json.load(arquivo)
-    except Exception as e:
-        print(f"Não foi possível carregar o cache anterior ({e}). Iniciando novo cache.")
+        linhas = env_file.read_text(
+            encoding="utf-8-sig"
+        ).splitlines()
+
+        for linha in linhas:
+            linha = linha.strip()
+
+            if not linha:
+                continue
+
+            if linha.startswith("#"):
+                continue
+
+            if "=" not in linha:
+                continue
+
+            chave, valor = linha.split(
+                "=",
+                1,
+            )
+
+            chave = (
+                chave
+                .strip()
+                .lstrip("\ufeff")
+            )
+
+            valor = (
+                valor
+                .strip()
+                .strip("\"'")
+            )
+
+            if (
+                chave
+                and chave not in os.environ
+            ):
+                os.environ[chave] = valor
+
+    except OSError:
+        pass
+
+
+carregar_env_local()
+
+GOOGLE_API_KEY = os.getenv(
+    "GOOGLE_BOOKS_API_KEY"
+)
+
+
+# ============================================================
+# UTILITÁRIOS
+# ============================================================
+
+def limpar(valor: Any) -> str:
+    if valor is None:
+        return ""
+
+    try:
+        if pd.isna(valor):
+            return ""
+    except (
+        TypeError,
+        ValueError,
+    ):
+        pass
+
+    texto = str(valor).strip()
+
+    if texto.lower() in {
+        "",
+        "nan",
+        "none",
+        "null",
+    }:
+        return ""
+
+    return texto
+
+
+def isbn_limpo(valor: Any) -> str:
+    return re.sub(
+        r"[^0-9X]",
+        "",
+        limpar(valor).upper(),
+    )
+
+
+def normalizar_texto(valor: Any) -> str:
+    """
+    Normalização Unicode:
+    preserva letras de diferentes alfabetos e remove apenas
+    pontuação/espaçamento irrelevante.
+    """
+
+    texto = limpar(valor).lower()
+
+    if not texto:
+        return ""
+
+    texto = unicodedata.normalize(
+        "NFKD",
+        texto,
+    )
+
+    texto = "".join(
+        caractere
+        for caractere in texto
+        if not unicodedata.combining(
+            caractere
+        )
+    )
+
+    texto = re.sub(
+        r"[^\w\s]",
+        " ",
+        texto,
+        flags=re.UNICODE,
+    )
+
+    return re.sub(
+        r"\s+",
+        " ",
+        texto,
+    ).strip()
+
+
+def titulo_busca(valor: Any) -> str:
+    titulo = limpar(valor)
+
+    titulo = re.sub(
+        r"\s*\([^)]*\)",
+        "",
+        titulo,
+    )
+
+    return titulo.split(":")[0].strip()
+
+
+def similaridade(
+    a: Any,
+    b: Any,
+) -> float:
+
+    a_norm = normalizar_texto(a)
+
+    b_norm = normalizar_texto(b)
+
+    if not a_norm or not b_norm:
+        return 0.0
+
+    if a_norm == b_norm:
+        return 1.0
+
+    return SequenceMatcher(
+        None,
+        a_norm,
+        b_norm,
+    ).ratio()
+
+
+def primeiro_autor(
+    valor: Any,
+) -> str:
+
+    if isinstance(valor, list):
+        return (
+            limpar(valor[0])
+            if valor
+            else ""
+        )
+
+    texto = limpar(valor)
+
+    if "|" in texto:
+        return (
+            texto
+            .split("|")[0]
+            .strip()
+        )
+
+    return texto
+
+
+def juntar_lista(
+    valor: Any,
+) -> str:
+
+    if isinstance(valor, list):
+        return "|".join(
+            limpar(item)
+            for item in valor
+            if limpar(item)
+        )
+
+    return limpar(valor)
+
+
+# ============================================================
+# JSON
+# ============================================================
+
+def carregar_json(
+    caminho: Path,
+) -> dict[str, Any]:
+
+    if not caminho.exists():
+        return {}
+
+    try:
+        with caminho.open(
+            "r",
+            encoding="utf-8",
+        ) as arquivo:
+
+            dados = json.load(
+                arquivo
+            )
+
+        if isinstance(
+            dados,
+            dict,
+        ):
+            return dados
+
+        return {}
+
+    except (
+        OSError,
+        json.JSONDecodeError,
+    ):
         return {}
 
 
-def salvar_cache(cache):
+def salvar_json(
+    caminho: Path,
+    dados: dict[str, Any],
+) -> None:
+
+    caminho.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    temporario = caminho.with_suffix(
+        caminho.suffix + ".tmp"
+    )
+
+    with temporario.open(
+        "w",
+        encoding="utf-8",
+    ) as arquivo:
+
+        json.dump(
+            dados,
+            arquivo,
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    temporario.replace(
+        caminho
+    )
+
+
+# ============================================================
+# RATE LIMIT
+# ============================================================
+
+def obter_retry_after(
+    resposta: requests.Response,
+) -> float | None:
+
+    valor = resposta.headers.get(
+        "Retry-After"
+    )
+
+    if not valor:
+        return None
+
+    valor = valor.strip()
+
     try:
-        with open(ARQUIVO_CACHE, "w", encoding="utf-8") as arquivo:
-            json.dump(cache, arquivo, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print(f"Erro ao salvar cache: {e}")
+        segundos = float(valor)
+
+        if segundos >= 0:
+            return segundos
+
+    except ValueError:
+        pass
+
+    return None
 
 
-cache = carregar_cache()
+def calcular_backoff(
+    tentativa: int,
+) -> float:
 
-def ja_coletado(book_id):
-    """Verifica se o livro já foi coletado com sucesso anteriormente."""
-    b_id = str(book_id).strip()
-    return b_id in cache and bool(cache[b_id])
+    atraso = min(
+        BACKOFF_MAX,
+        BACKOFF_BASE
+        ** max(tentativa, 1),
+    )
+
+    jitter = random.uniform(
+        0,
+        BACKOFF_JITTER,
+    )
+
+    return atraso + jitter
 
 
-total_cache_valido = sum(1 for v in cache.values() if v)
-print(f"Cache carregado: {len(cache):,} entradas ({total_cache_valido:,} livros válidos já coletados)")
+def esperar_rate_limit(
+    resposta: requests.Response,
+    tentativa: int,
+    fonte: str,
+) -> bool:
+
+    if resposta.status_code != 429:
+        return False
+
+    retry_after = obter_retry_after(
+        resposta
+    )
+
+    if retry_after is not None:
+        espera = min(
+            retry_after,
+            BACKOFF_MAX,
+        )
+
+        origem = (
+            "Retry-After"
+        )
+
+    else:
+        espera = calcular_backoff(
+            tentativa
+        )
+
+        origem = (
+            "backoff exponencial"
+        )
+
+    print(
+        f"[{fonte}] HTTP 429. "
+        f"Aguardando {espera:.1f}s "
+        f"({origem}; tentativa "
+        f"{tentativa}/{MAX_RETRIES_429})."
+    )
+
+    time.sleep(espera)
+
+    return True
 
 
 # ============================================================
-# CARREGAR DATASETS
+# REQUEST COM RETRY
 # ============================================================
 
-print()
-print("=" * 70)
-print("CARREGANDO DATASETS GOODREADS")
-print("=" * 70)
+def get_com_retry(
+    session: requests.Session,
+    url: str,
+    *,
+    params: dict[str, Any] | None = None,
+    headers: dict[str, str] | None = None,
+    timeout: int = 20,
+    fonte: str = "API",
+) -> requests.Response | None:
 
-df_books = pd.read_parquet(ARQUIVO_BOOKS)
-df_reviews = pd.read_parquet(ARQUIVO_REVIEWS)
+    for tentativa in range(
+        1,
+        MAX_RETRIES_429 + 1,
+    ):
 
-print(f"Livros únicos: {len(df_books):,}")
-print(f"Reviews:       {len(df_reviews):,}")
+        try:
+            resposta = session.get(
+                url,
+                params=params,
+                headers=headers,
+                timeout=timeout,
+            )
+
+        except requests.RequestException as erro:
+
+            if tentativa >= MAX_RETRIES_429:
+                print(
+                    f"[{fonte}] Erro de rede "
+                    f"após {tentativa} tentativas: "
+                    f"{erro}"
+                )
+                return None
+
+            espera = min(
+                BACKOFF_MAX,
+                BACKOFF_BASE
+                ** tentativa,
+            )
+
+            espera += random.uniform(
+                0,
+                BACKOFF_JITTER,
+            )
+
+            print(
+                f"[{fonte}] Erro de rede. "
+                f"Nova tentativa em "
+                f"{espera:.1f}s."
+            )
+
+            time.sleep(
+                espera
+            )
+
+            continue
+
+        if resposta.status_code != 429:
+            return resposta
+
+        if tentativa >= MAX_RETRIES_429:
+            print(
+                f"[{fonte}] HTTP 429 "
+                f"persistente após "
+                f"{tentativa} tentativas."
+            )
+
+            return resposta
+
+        esperar_rate_limit(
+            resposta,
+            tentativa,
+            fonte,
+        )
+
+    return None
 
 
 # ============================================================
-# NORMALIZAÇÃO DE VALORES E STRINGS
+# MIGRAÇÃO DO CACHE ANTIGO
 # ============================================================
 
-def limpar_valor(valor):
-    if pd.isna(valor):
-        return ""
-    v = str(valor).strip()
-    if v.lower() in ["nan", "none", "null"]:
-        return ""
-    return v
+def parece_openlibrary(
+    registro: Any,
+) -> bool:
+
+    if not isinstance(
+        registro,
+        dict,
+    ):
+        return False
+
+    origem = limpar(
+        registro.get(
+            "api_source"
+        )
+    ).lower()
+
+    tipo = limpar(
+        registro.get(
+            "google_kind"
+        )
+    ).lower()
+
+    metodo = limpar(
+        registro.get(
+            "search_method"
+        )
+    ).lower()
+
+    return (
+        origem.startswith(
+            "openlibrary"
+        )
+        or "openlibrary" in tipo
+        or "openlibrary" in metodo
+    )
 
 
-def normalizar_texto(texto):
-    """Normaliza texto para comparações robustas (sem pontuação e minúsculo)."""
-    return re.sub(r"[^a-z0-9 ]", "", str(texto).lower()).strip()
+def converter_cache_antigo_openlibrary(
+    registro: dict[str, Any],
+) -> dict[str, Any]:
 
+    mapa = {
+        "google_volume_id":
+            "openlibrary_key",
 
-def limpar_titulo(titulo):
-    """Remove subtítulos e sufixos de série entre parênteses para busca limpa."""
-    t = str(titulo).strip()
-    t_sem_parenteses = re.sub(r"\s*\(.*?\)\s*", " ", t)
-    t_sem_dois_pontos = t_sem_parenteses.split(":")[0]
-    return t_sem_dois_pontos.strip()
+        "google_title":
+            "openlibrary_title",
 
+        "google_subtitle":
+            "openlibrary_subtitle",
 
-for col in ["isbn", "isbn13", "title", "title_without_series", "author_ids", "publisher", "publication_year", "num_pages"]:
-    if col not in df_books.columns:
-        df_books[col] = ""
-    df_books[col] = df_books[col].apply(limpar_valor)
+        "google_authors":
+            "openlibrary_authors",
 
+        "google_publisher":
+            "openlibrary_publishers",
 
-# ============================================================
-# PARSERS DE RESPOSTA
-# ============================================================
+        "google_published_date":
+            "openlibrary_published_date",
 
-def extrair_volume_openlibrary(data, book_id, metodo_busca="openlibrary_batch"):
-    authors_list = []
-    authors_raw = data.get("authors", [])
-    if isinstance(authors_raw, list):
-        for a in authors_raw:
-            if isinstance(a, dict) and a.get("name"):
-                authors_list.append(str(a.get("name")).strip())
-    autores = "|".join(authors_list)
-    if not autores and data.get("by_statement"):
-        autores = str(data.get("by_statement")).replace("by ", "").strip()
+        "google_description":
+            "openlibrary_description",
 
-    subjects_list = []
-    subjects_raw = data.get("subjects", [])
-    if isinstance(subjects_raw, list):
-        for s in subjects_raw:
-            if isinstance(s, dict) and s.get("name"):
-                subjects_list.append(str(s.get("name")).strip())
-            elif isinstance(s, str):
-                subjects_list.append(s.strip())
-    categorias = "|".join(subjects_list[:15])
+        "google_page_count":
+            "openlibrary_pages",
 
-    publishers_list = []
-    publishers_raw = data.get("publishers", [])
-    if isinstance(publishers_raw, list):
-        for p in publishers_raw:
-            if isinstance(p, dict) and p.get("name"):
-                publishers_list.append(str(p.get("name")).strip())
-            elif isinstance(p, str):
-                publishers_list.append(p.strip())
-    editora = ", ".join(publishers_list)
+        "google_categories":
+            "openlibrary_subjects",
 
-    cover = data.get("cover", {})
-    thumbnail = ""
-    small_thumbnail = ""
-    if isinstance(cover, dict):
-        thumbnail = cover.get("medium", "") or cover.get("large", "")
-        small_thumbnail = cover.get("small", "")
+        "google_isbn10":
+            "openlibrary_isbn10",
 
-    identifiers = data.get("identifiers", {})
-    isbn10_list = identifiers.get("isbn_10", []) if isinstance(identifiers, dict) else []
-    isbn13_list = identifiers.get("isbn_13", []) if isinstance(identifiers, dict) else []
-    isbn10 = isbn10_list[0] if (isinstance(isbn10_list, list) and isbn10_list) else ""
-    isbn13 = isbn13_list[0] if (isinstance(isbn13_list, list) and isbn13_list) else ""
+        "google_isbn13":
+            "openlibrary_isbn13",
 
-    page_count = data.get("number_of_pages", "")
-    if not page_count and data.get("pagination"):
-        page_count = str(data.get("pagination")).strip()
+        "google_thumbnail":
+            "openlibrary_thumbnail",
 
-    return {
-        "google_volume_id": data.get("key", ""),
-        "google_kind": "openlibrary#book",
-        "search_method": metodo_busca,
-        "google_title": data.get("title", ""),
-        "google_subtitle": data.get("subtitle", ""),
-        "google_authors": autores,
-        "google_publisher": editora,
-        "google_published_date": str(data.get("publish_date", "")),
-        "google_description": str(data.get("notes", "") or ""),
-        "google_page_count": page_count,
-        "google_categories": categorias,
-        "google_average_rating": "",
-        "google_ratings_count": "",
-        "google_language": "",
-        "google_isbn10": isbn10,
-        "google_isbn13": isbn13,
-        "google_maturity_rating": "",
-        "google_print_type": "BOOK",
-        "google_text_snippet": "",
-        "google_thumbnail": thumbnail,
-        "google_small_thumbnail": small_thumbnail,
-        "google_preview_link": data.get("url", ""),
-        "google_info_link": data.get("url", ""),
-        "google_web_reader_link": "",
-        "google_viewability": "",
-        "google_public_domain": False,
-        "google_ebook_available": False,
-        "google_saleability": "",
-        "goodreads_book_id": str(book_id),
-        "api_source": "openlibrary"
+        "google_small_thumbnail":
+            "openlibrary_small_thumbnail",
+
+        "google_preview_link":
+            "openlibrary_url",
+
+        "google_info_link":
+            "openlibrary_url",
     }
 
+    novo = {}
 
-def extrair_volume_openlibrary_search(doc, book_id, score_validacao=100):
-    autores_raw = doc.get("author_name", [])
-    autores = "|".join(str(a).strip() for a in autores_raw) if isinstance(autores_raw, list) else str(autores_raw)
+    for origem, destino in mapa.items():
 
-    publishers_raw = doc.get("publisher", [])
-    editora = ", ".join(str(p).strip() for p in publishers_raw[:3]) if isinstance(publishers_raw, list) else str(publishers_raw)
+        if origem in registro:
+            novo[destino] = (
+                registro.get(origem)
+            )
 
-    subjects_raw = doc.get("subject", [])
-    categorias = "|".join(str(s).strip() for s in subjects_raw[:15]) if isinstance(subjects_raw, list) else ""
+    novo["status"] = "matched"
 
-    cover_id = doc.get("cover_i")
-    thumbnail = f"https://covers.openlibrary.org/b/id/{cover_id}-M.jpg" if cover_id else ""
-    small_thumbnail = f"https://covers.openlibrary.org/b/id/{cover_id}-S.jpg" if cover_id else ""
+    novo["source"] = "openlibrary"
 
-    isbns = doc.get("isbn", [])
+    novo["search_method"] = registro.get(
+        "search_method",
+        "",
+    )
+
+    return novo
+
+
+def migrar_caches() -> tuple[
+    dict[str, Any],
+    dict[str, Any],
+]:
+
+    cache_antigo = carregar_json(
+        ARQUIVO_CACHE_ANTIGO
+    )
+
+    cache_openlibrary = carregar_json(
+        ARQUIVO_CACHE_OPENLIBRARY
+    )
+
+    cache_google = carregar_json(
+        ARQUIVO_CACHE_GOOGLE
+    )
+
+    migrados_ol = 0
+
+    migrados_google = 0
+
+    for book_id, registro in (
+        cache_antigo.items()
+    ):
+
+        if not registro:
+            continue
+
+        book_id = str(
+            book_id
+        )
+
+        if parece_openlibrary(
+            registro
+        ):
+
+            if (
+                book_id
+                not in cache_openlibrary
+            ):
+
+                cache_openlibrary[
+                    book_id
+                ] = (
+                    converter_cache_antigo_openlibrary(
+                        registro
+                    )
+                )
+
+                migrados_ol += 1
+
+        elif isinstance(
+            registro,
+            dict,
+        ):
+
+            if (
+                book_id
+                not in cache_google
+            ):
+
+                cache_google[
+                    book_id
+                ] = registro
+
+                migrados_google += 1
+
+    salvar_json(
+        ARQUIVO_CACHE_OPENLIBRARY,
+        cache_openlibrary,
+    )
+
+    salvar_json(
+        ARQUIVO_CACHE_GOOGLE,
+        cache_google,
+    )
+
+    print(
+        f"Cache antigo migrado: "
+        f"{migrados_ol:,} Open Library + "
+        f"{migrados_google:,} Google Books."
+    )
+
+    return (
+        cache_openlibrary,
+        cache_google,
+    )
+
+
+# ============================================================
+# PARSERS OPEN LIBRARY
+# ============================================================
+
+def extrair_openlibrary_batch(
+    dados: dict[str, Any],
+    book_id: str,
+    metodo: str,
+) -> dict[str, Any]:
+
+    autores = []
+
+    for autor in dados.get(
+        "authors",
+        [],
+    ):
+
+        if isinstance(
+            autor,
+            dict,
+        ):
+
+            nome = limpar(
+                autor.get("name")
+            )
+
+            if nome:
+                autores.append(nome)
+
+    categorias = []
+
+    for subject in dados.get(
+        "subjects",
+        [],
+    ):
+
+        if isinstance(
+            subject,
+            dict,
+        ):
+            nome = limpar(
+                subject.get("name")
+            )
+        else:
+            nome = limpar(subject)
+
+        if nome:
+            categorias.append(nome)
+
+    editoras = []
+
+    for publisher in dados.get(
+        "publishers",
+        [],
+    ):
+
+        if isinstance(
+            publisher,
+            dict,
+        ):
+            nome = limpar(
+                publisher.get("name")
+            )
+        else:
+            nome = limpar(
+                publisher
+            )
+
+        if nome:
+            editoras.append(nome)
+
+    identificadores = dados.get(
+        "identifiers",
+        {},
+    )
+
     isbn10 = ""
-    isbn13 = ""
-    if isinstance(isbns, list):
-        for code in isbns:
-            code_str = str(code).strip()
-            if len(code_str) == 13 and not isbn13:
-                isbn13 = code_str
-            elif len(code_str) == 10 and not isbn10:
-                isbn10 = code_str
 
-    key = doc.get("key", "")
-    url = f"https://openlibrary.org{key}" if key else ""
+    isbn13 = ""
+
+    if isinstance(
+        identificadores,
+        dict,
+    ):
+
+        isbn10_list = (
+            identificadores.get(
+                "isbn_10",
+                [],
+            )
+        )
+
+        isbn13_list = (
+            identificadores.get(
+                "isbn_13",
+                [],
+            )
+        )
+
+        if isbn10_list:
+            isbn10 = limpar(
+                isbn10_list[0]
+            )
+
+        if isbn13_list:
+            isbn13 = limpar(
+                isbn13_list[0]
+            )
+
+    cover = dados.get(
+        "cover",
+        {},
+    )
+
+    thumbnail = ""
+
+    if isinstance(
+        cover,
+        dict,
+    ):
+
+        thumbnail = (
+            limpar(
+                cover.get("medium")
+            )
+            or limpar(
+                cover.get("large")
+            )
+            or limpar(
+                cover.get("small")
+            )
+        )
+
+    paginas = (
+        dados.get(
+            "number_of_pages"
+        )
+        or dados.get(
+            "pagination"
+        )
+    )
 
     return {
-        "google_volume_id": key,
-        "google_kind": "openlibrary#search_doc",
-        "search_method": f"openlibrary_search_validated_score_{score_validacao}",
-        "google_title": doc.get("title", ""),
-        "google_subtitle": doc.get("subtitle", ""),
-        "google_authors": autores,
-        "google_publisher": editora,
-        "google_published_date": str(doc.get("first_publish_year", "")),
-        "google_description": "",
-        "google_page_count": doc.get("number_of_pages_median", ""),
-        "google_categories": categorias,
-        "google_average_rating": "",
-        "google_ratings_count": "",
-        "google_language": "",
-        "google_isbn10": isbn10,
-        "google_isbn13": isbn13,
-        "google_maturity_rating": "",
-        "google_print_type": "BOOK",
-        "google_text_snippet": "",
-        "google_thumbnail": thumbnail,
-        "google_small_thumbnail": small_thumbnail,
-        "google_preview_link": url,
-        "google_info_link": url,
-        "google_web_reader_link": "",
-        "google_viewability": "",
-        "google_public_domain": False,
-        "google_ebook_available": False,
-        "google_saleability": "",
-        "goodreads_book_id": str(book_id),
-        "api_source": "openlibrary_search"
+        "status":
+            "matched",
+
+        "source":
+            "openlibrary",
+
+        "openlibrary_key":
+            limpar(
+                dados.get("key")
+            ),
+
+        "openlibrary_title":
+            limpar(
+                dados.get("title")
+            ),
+
+        "openlibrary_subtitle":
+            limpar(
+                dados.get("subtitle")
+            ),
+
+        "openlibrary_authors":
+            "|".join(autores),
+
+        "openlibrary_publishers":
+            "|".join(editoras),
+
+        "openlibrary_published_date":
+            limpar(
+                dados.get(
+                    "publish_date"
+                )
+            ),
+
+        "openlibrary_description":
+            limpar(
+                dados.get("notes")
+            ),
+
+        "openlibrary_pages":
+            paginas,
+
+        "openlibrary_subjects":
+            "|".join(
+                categorias[:20]
+            ),
+
+        "openlibrary_isbn10":
+            isbn10,
+
+        "openlibrary_isbn13":
+            isbn13,
+
+        "openlibrary_thumbnail":
+            thumbnail,
+
+        "openlibrary_url": (
+            f"https://openlibrary.org"
+            f"{limpar(dados.get('key'))}"
+            if limpar(
+                dados.get("key")
+            )
+            else ""
+        ),
+
+        "openlibrary_search_method":
+            metodo,
+
+        "goodreads_book_id":
+            book_id,
     }
 
 
-def extrair_volume_google(volume, metodo_busca, book_id):
-    volume_info = volume.get("volumeInfo", {})
-    sale_info = volume.get("saleInfo", {})
-    access_info = volume.get("accessInfo", {})
+def extrair_openlibrary_search(
+    doc: dict[str, Any],
+    book_id: str,
+    metodo: str,
+) -> dict[str, Any]:
 
-    autores = volume_info.get("authors", [])
-    autores = "|".join(str(autor) for autor in autores) if isinstance(autores, list) else ""
+    subjects = doc.get(
+        "subject",
+        [],
+    )
 
-    categorias = volume_info.get("categories", [])
-    categorias = "|".join(str(categoria) for categoria in categorias) if isinstance(categorias, list) else ""
+    if not isinstance(
+        subjects,
+        list,
+    ):
+        subjects = []
 
-    identifiers = volume_info.get("industryIdentifiers", [])
-    isbn_10 = ""
-    isbn_13 = ""
-    if isinstance(identifiers, list):
-        for identifier in identifiers:
-            if isinstance(identifier, dict):
-                tipo = identifier.get("type", "")
-                valor = identifier.get("identifier", "")
+    return {
+        "status":
+            "matched",
+
+        "source":
+            "openlibrary",
+
+        "openlibrary_key":
+            limpar(
+                doc.get("key")
+            ),
+
+        "openlibrary_title":
+            limpar(
+                doc.get("title")
+            ),
+
+        "openlibrary_subtitle":
+            limpar(
+                doc.get("subtitle")
+            ),
+
+        "openlibrary_authors":
+            juntar_lista(
+                doc.get(
+                    "author_name",
+                    [],
+                )
+            ),
+
+        "openlibrary_publishers":
+            juntar_lista(
+                doc.get(
+                    "publisher",
+                    [],
+                )
+            ),
+
+        "openlibrary_published_date":
+            limpar(
+                doc.get(
+                    "first_publish_year"
+                )
+            ),
+
+        "openlibrary_description":
+            "",
+
+        "openlibrary_pages":
+            doc.get(
+                "number_of_pages_median"
+            ),
+
+        "openlibrary_subjects":
+            juntar_lista(
+                subjects[:20]
+            ),
+
+        "openlibrary_isbn10":
+            "",
+
+        "openlibrary_isbn13":
+            "",
+
+        "openlibrary_thumbnail": (
+            f"https://covers.openlibrary.org/b/id/"
+            f"{doc.get('cover_i')}-M.jpg"
+            if doc.get("cover_i")
+            else ""
+        ),
+
+        "openlibrary_url": (
+            f"https://openlibrary.org"
+            f"{limpar(doc.get('key'))}"
+            if limpar(
+                doc.get("key")
+            )
+            else ""
+        ),
+
+        "openlibrary_search_method":
+            metodo,
+
+        "goodreads_book_id":
+            book_id,
+    }
+
+
+# ============================================================
+# SCORE OPEN LIBRARY
+# ============================================================
+
+def score_openlibrary_doc(
+    row: pd.Series,
+    doc: dict[str, Any],
+) -> tuple[
+    int,
+    dict[str, float],
+]:
+
+    titulo_gr = (
+        limpar(
+            row.get(
+                "title_without_series"
+            )
+        )
+        or limpar(
+            row.get("title")
+        )
+    )
+
+    autor_gr = primeiro_autor(
+        row.get("authors")
+    )
+
+    ano_gr = limpar(
+        row.get(
+            "publication_year"
+        )
+    )
+
+    editora_gr = limpar(
+        row.get("publisher")
+    )
+
+    titulo_ol = limpar(
+        doc.get("title")
+    )
+
+    score = 0
+
+    sim_titulo = similaridade(
+        titulo_gr,
+        titulo_ol,
+    )
+
+    if sim_titulo >= 0.97:
+        score += 60
+
+    elif sim_titulo >= 0.92:
+        score += 48
+
+    elif sim_titulo >= 0.85:
+        score += 35
+
+    elif sim_titulo >= 0.75:
+        score += 20
+
+    else:
+        return (
+            0,
+            {
+                "title_similarity":
+                    sim_titulo,
+                "author_similarity":
+                    0.0,
+            },
+        )
+
+    sim_autor = 0.0
+
+    autores = doc.get(
+        "author_name",
+        [],
+    )
+
+    if isinstance(
+        autores,
+        list,
+    ):
+
+        for autor in autores[:10]:
+
+            sim_autor = max(
+                sim_autor,
+                similaridade(
+                    autor_gr,
+                    autor,
+                ),
+            )
+
+    # Autor forte ajuda na confirmação.
+    if sim_autor >= 0.95:
+        score += 20
+
+    elif sim_autor >= 0.85:
+        score += 15
+
+    elif sim_autor >= 0.70:
+        score += 8
+
+    ano_ol = limpar(
+        doc.get(
+            "first_publish_year"
+        )
+    )
+
+    if ano_gr and ano_ol:
+
+        try:
+
+            diferenca = abs(
+                int(ano_gr)
+                - int(ano_ol)
+            )
+
+            if diferenca <= 1:
+                score += 25
+
+            elif diferenca <= 3:
+                score += 15
+
+            elif diferenca > 10:
+                score -= 15
+
+        except ValueError:
+            pass
+
+    editoras = doc.get(
+        "publisher",
+        [],
+    )
+
+    if (
+        editora_gr
+        and isinstance(
+            editoras,
+            list,
+        )
+    ):
+
+        gr_pub = normalizar_texto(
+            editora_gr
+        )
+
+        for pub in editoras[:10]:
+
+            pub_norm = normalizar_texto(
+                pub
+            )
+
+            if (
+                pub_norm
+                and (
+                    pub_norm in gr_pub
+                    or gr_pub in pub_norm
+                )
+            ):
+
+                score += 15
+                break
+
+    return (
+        score,
+        {
+            "title_similarity":
+                sim_titulo,
+
+            "author_similarity":
+                sim_autor,
+        },
+    )
+
+
+# ============================================================
+# OPEN LIBRARY POR TÍTULO
+# ============================================================
+
+def buscar_openlibrary_por_titulo(
+    session: requests.Session,
+    row: pd.Series,
+) -> dict[str, Any] | None:
+
+    titulo = (
+        limpar(
+            row.get(
+                "title_without_series"
+            )
+        )
+        or limpar(
+            row.get("title")
+        )
+    )
+
+    titulo = titulo_busca(
+        titulo
+    )
+
+    if not titulo:
+        return None
+
+    params = {
+        "title":
+            titulo,
+
+        "limit":
+            OPENLIBRARY_SEARCH_LIMIT,
+
+        "fields": (
+            "key,title,subtitle,author_name,"
+            "first_publish_year,publisher,"
+            "isbn,subject,number_of_pages_median,"
+            "cover_i"
+        ),
+    }
+
+    resposta = get_com_retry(
+        session,
+        OPENLIBRARY_SEARCH_URL,
+        params=params,
+        headers=OPENLIBRARY_HEADERS,
+        timeout=20,
+        fonte="Open Library",
+    )
+
+    if resposta is None:
+        return None
+
+    if resposta.status_code == 429:
+        return {
+            "status":
+                "rate_limited",
+
+            "source":
+                "openlibrary",
+        }
+
+    if resposta.status_code != 200:
+        return None
+
+    try:
+        dados = resposta.json()
+
+    except ValueError:
+        return None
+
+    documentos = dados.get(
+        "docs",
+        [],
+    )
+
+    melhor = None
+
+    melhor_score = 0
+
+    melhor_sinais = {}
+
+    for doc in documentos:
+
+        if not isinstance(
+            doc,
+            dict,
+        ):
+            continue
+
+        score, sinais = (
+            score_openlibrary_doc(
+                row,
+                doc,
+            )
+        )
+
+        if score > melhor_score:
+
+            melhor_score = score
+
+            melhor = doc
+
+            melhor_sinais = sinais
+
+    if (
+        melhor is None
+        or melhor_score < 55
+    ):
+        return None
+
+    resultado = (
+        extrair_openlibrary_search(
+            melhor,
+            str(
+                row["book_id"]
+            ),
+            f"openlibrary_title_score_{melhor_score}",
+        )
+    )
+
+    resultado.update(
+        {
+            "title_similarity":
+                round(
+                    melhor_sinais[
+                        "title_similarity"
+                    ],
+                    4,
+                ),
+
+            "author_similarity":
+                round(
+                    melhor_sinais[
+                        "author_similarity"
+                    ],
+                    4,
+                ),
+
+            "search_score":
+                melhor_score,
+        }
+    )
+
+    isbns = melhor.get(
+        "isbn",
+        [],
+    )
+
+    if isinstance(
+        isbns,
+        list,
+    ):
+
+        for item in isbns:
+
+            code = isbn_limpo(
+                item
+            )
+
+            if (
+                len(code) == 13
+                and not resultado[
+                    "openlibrary_isbn13"
+                ]
+            ):
+
+                resultado[
+                    "openlibrary_isbn13"
+                ] = code
+
+            elif (
+                len(code) == 10
+                and not resultado[
+                    "openlibrary_isbn10"
+                ]
+            ):
+
+                resultado[
+                    "openlibrary_isbn10"
+                ] = code
+
+    return resultado
+
+
+# ============================================================
+# OPEN LIBRARY POR ISBN
+# ============================================================
+
+def consultar_openlibrary_batch(
+    df_books: pd.DataFrame,
+    cache: dict[str, Any],
+) -> None:
+
+    if SKIP_OPENLIBRARY:
+
+        print(
+            "[Open Library] "
+            "etapa desativada."
+        )
+
+        return
+
+    pendentes = {}
+
+    for _, row in df_books.iterrows():
+
+        book_id = str(
+            row["book_id"]
+        ).strip()
+
+        if book_id in cache:
+            continue
+
+        isbn13 = isbn_limpo(
+            row.get("isbn13")
+        )
+
+        isbn10 = isbn_limpo(
+            row.get("isbn")
+        )
+
+        codigo = (
+            isbn13
+            or isbn10
+        )
+
+        if codigo:
+
+            pendentes.setdefault(
+                codigo,
+                [],
+            ).append(
+                book_id
+            )
+
+    if MAX_NEW_OPENLIBRARY_BOOKS:
+
+        ids_permitidos = set(
+            list(
+                dict.fromkeys(
+                    book_id
+                    for ids in pendentes.values()
+                    for book_id in ids
+                )
+            )[
+                :MAX_NEW_OPENLIBRARY_BOOKS
+            ]
+        )
+
+        pendentes = {
+            codigo: [
+                book_id
+                for book_id in ids
+                if book_id
+                in ids_permitidos
+            ]
+            for codigo, ids
+            in pendentes.items()
+        }
+
+        pendentes = {
+            codigo: ids
+            for codigo, ids
+            in pendentes.items()
+            if ids
+        }
+
+    codigos = list(
+        pendentes
+    )
+
+    print(
+        f"[Open Library] ISBNs pendentes: "
+        f"{len(codigos):,}"
+    )
+
+    if not codigos:
+        return
+
+    total_encontrados = 0
+
+    session = requests.Session()
+
+    try:
+
+        for inicio in tqdm(
+            range(
+                0,
+                len(codigos),
+                OPENLIBRARY_BATCH_SIZE,
+            ),
+            desc="Open Library - ISBN",
+        ):
+
+            lote = codigos[
+                inicio:
+                inicio
+                + OPENLIBRARY_BATCH_SIZE
+            ]
+
+            bibkeys = ",".join(
+                f"ISBN:{codigo}"
+                for codigo in lote
+            )
+
+            params = {
+                "bibkeys":
+                    bibkeys,
+
+                "format":
+                    "json",
+
+                "jscmd":
+                    "data",
+            }
+
+            resposta = get_com_retry(
+                session,
+                OPENLIBRARY_BATCH_URL,
+                params=params,
+                headers=OPENLIBRARY_HEADERS,
+                timeout=30,
+                fonte="Open Library",
+            )
+
+            if resposta is None:
+                continue
+
+            if resposta.status_code == 429:
+
+                print(
+                    "[Open Library] "
+                    "Limite persistente. "
+                    "Encerrando etapa por ISBN."
+                )
+
+                break
+
+            if resposta.status_code != 200:
+
+                time.sleep(
+                    OPENLIBRARY_DELAY
+                )
+
+                continue
+
+            try:
+
+                dados = resposta.json()
+
+            except ValueError:
+
+                continue
+
+            for codigo in lote:
+
+                chave = (
+                    f"ISBN:{codigo}"
+                )
+
+                if chave not in dados:
+                    continue
+
+                livro = dados[
+                    chave
+                ]
+
+                for book_id in (
+                    pendentes[codigo]
+                ):
+
+                    cache[
+                        book_id
+                    ] = (
+                        extrair_openlibrary_batch(
+                            livro,
+                            book_id,
+                            "openlibrary_isbn",
+                        )
+                    )
+
+                    total_encontrados += 1
+
+            # Checkpoint após cada lote.
+            salvar_json(
+                ARQUIVO_CACHE_OPENLIBRARY,
+                cache,
+            )
+
+            time.sleep(
+                OPENLIBRARY_DELAY
+            )
+
+    except KeyboardInterrupt:
+
+        print(
+            "\n[Open Library] "
+            "Interrupção detectada. "
+            "Salvando cache..."
+        )
+
+        salvar_json(
+            ARQUIVO_CACHE_OPENLIBRARY,
+            cache,
+        )
+
+        raise
+
+    except Exception as erro:
+
+        print(
+            f"[Open Library] "
+            f"Erro inesperado: {erro}"
+        )
+
+        salvar_json(
+            ARQUIVO_CACHE_OPENLIBRARY,
+            cache,
+        )
+
+    print(
+        f"[Open Library] novos matches "
+        f"por ISBN: "
+        f"{total_encontrados:,}"
+    )
+
+
+# ============================================================
+# OPEN LIBRARY POR TÍTULO
+# ============================================================
+
+def consultar_openlibrary_titulos(
+    df_books: pd.DataFrame,
+    cache: dict[str, Any],
+) -> None:
+
+    if SKIP_OPENLIBRARY:
+        return
+
+    pendentes = []
+
+    for _, row in df_books.iterrows():
+
+        book_id = str(
+            row["book_id"]
+        ).strip()
+
+        if book_id in cache:
+            continue
+
+        pendentes.append(
+            row
+        )
+
+    if MAX_NEW_OPENLIBRARY_BOOKS:
+
+        pendentes = pendentes[
+            :MAX_NEW_OPENLIBRARY_BOOKS
+        ]
+
+    print(
+        f"[Open Library] títulos pendentes: "
+        f"{len(pendentes):,}"
+    )
+
+    if not pendentes:
+        return
+
+    total_encontrados = 0
+
+    session = requests.Session()
+
+    def tarefa(
+        row: pd.Series,
+    ):
+
+        resultado = (
+            buscar_openlibrary_por_titulo(
+                session,
+                row,
+            )
+        )
+
+        return (
+            str(
+                row["book_id"]
+            ).strip(),
+            resultado,
+        )
+
+    futuros = []
+
+    try:
+
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=OPENLIBRARY_SEARCH_WORKERS
+        ) as executor:
+
+            futuros = [
+                executor.submit(
+                    tarefa,
+                    row,
+                )
+                for _, row
+                in pd.DataFrame(
+                    pendentes
+                ).iterrows()
+            ]
+
+            for futuro in tqdm(
+                concurrent.futures.as_completed(
+                    futuros
+                ),
+                total=len(futuros),
+                desc="Open Library - título",
+            ):
+
+                try:
+
+                    (
+                        book_id,
+                        resultado,
+                    ) = futuro.result()
+
+                    if (
+                        resultado
+                        and resultado.get(
+                            "status"
+                        )
+                        == "matched"
+                    ):
+
+                        cache[
+                            book_id
+                        ] = resultado
+
+                        total_encontrados += 1
+
+                    elif (
+                        resultado
+                        and resultado.get(
+                            "status"
+                        )
+                        == "rate_limited"
+                    ):
+
+                        print(
+                            "[Open Library] "
+                            "Rate limit detectado."
+                        )
+
+                        # Não adicionamos esse livro ao cache.
+                        # Assim ele poderá ser retomado.
+                        break
+
+                except Exception as erro:
+
+                    print(
+                        "[Open Library] "
+                        f"Erro em tarefa: {erro}"
+                    )
+
+                if (
+                    total_encontrados
+                    and total_encontrados
+                    % CACHE_SAVE_EVERY
+                    == 0
+                ):
+
+                    salvar_json(
+                        ARQUIVO_CACHE_OPENLIBRARY,
+                        cache,
+                    )
+
+    except KeyboardInterrupt:
+
+        print(
+            "\n[Open Library] "
+            "Interrupção detectada. "
+            "Salvando cache..."
+        )
+
+        salvar_json(
+            ARQUIVO_CACHE_OPENLIBRARY,
+            cache,
+        )
+
+        raise
+
+    except Exception as erro:
+
+        print(
+            f"[Open Library] "
+            f"Erro inesperado: {erro}"
+        )
+
+        salvar_json(
+            ARQUIVO_CACHE_OPENLIBRARY,
+            cache,
+        )
+
+    finally:
+
+        salvar_json(
+            ARQUIVO_CACHE_OPENLIBRARY,
+            cache,
+        )
+
+    print(
+        f"[Open Library] novos matches "
+        f"por título: "
+        f"{total_encontrados:,}"
+    )
+
+
+# ============================================================
+# GOOGLE BOOKS
+# ============================================================
+
+def buscar_google(
+    session: requests.Session,
+    row: pd.Series,
+) -> dict[str, Any] | None:
+
+    book_id = str(
+        row["book_id"]
+    ).strip()
+
+    isbn13 = isbn_limpo(
+        row.get("isbn13")
+    )
+
+    isbn10 = isbn_limpo(
+        row.get("isbn")
+    )
+
+    titulo = (
+        limpar(
+            row.get(
+                "title_without_series"
+            )
+        )
+        or limpar(
+            row.get("title")
+        )
+    )
+
+    queries = []
+
+    if isbn13:
+
+        queries.append(
+            (
+                f"isbn:{isbn13}",
+                "google_isbn13",
+            )
+        )
+
+    if isbn10:
+
+        queries.append(
+            (
+                f"isbn:{isbn10}",
+                "google_isbn10",
+            )
+        )
+
+    titulo_limpo = titulo_busca(
+        titulo
+    )
+
+    if titulo_limpo:
+
+        queries.append(
+            (
+                f'intitle:"{titulo_limpo}"',
+                "google_title",
+            )
+        )
+
+    for query, metodo in queries:
+
+        params = {
+            "q":
+                query,
+
+            "maxResults":
+                GOOGLE_MAX_RESULTS,
+
+            "printType":
+                "books",
+        }
+
+        if GOOGLE_API_KEY:
+
+            params["key"] = (
+                GOOGLE_API_KEY
+            )
+
+        resposta = get_com_retry(
+            session,
+            GOOGLE_BOOKS_URL,
+            params=params,
+            headers=GOOGLE_HEADERS,
+            timeout=GOOGLE_TIMEOUT,
+            fonte="Google Books",
+        )
+
+        if resposta is None:
+            continue
+
+        if resposta.status_code == 429:
+
+            return {
+                "status":
+                    "rate_limited",
+
+                "source":
+                    "google_books",
+            }
+
+        if resposta.status_code != 200:
+            continue
+
+        try:
+
+            dados = resposta.json()
+
+        except ValueError:
+
+            continue
+
+        itens = dados.get(
+            "items",
+            [],
+        )
+
+        if not itens:
+            continue
+
+        melhor = None
+
+        melhor_score = -1
+
+        for item in itens:
+
+            if not isinstance(
+                item,
+                dict,
+            ):
+                continue
+
+            info = item.get(
+                "volumeInfo",
+                {},
+            )
+
+            sim_titulo = similaridade(
+                titulo,
+                info.get(
+                    "title",
+                    "",
+                ),
+            )
+
+            score = sim_titulo
+
+            if metodo.startswith(
+                "google_isbn"
+            ):
+
+                score += 2
+
+            if score > melhor_score:
+
+                melhor_score = score
+
+                melhor = item
+
+        if melhor is None:
+            continue
+
+        info = melhor.get(
+            "volumeInfo",
+            {},
+        )
+
+        sale = melhor.get(
+            "saleInfo",
+            {},
+        )
+
+        access = melhor.get(
+            "accessInfo",
+            {},
+        )
+
+        autores = juntar_lista(
+            info.get(
+                "authors",
+                [],
+            )
+        )
+
+        categorias = juntar_lista(
+            info.get(
+                "categories",
+                [],
+            )
+        )
+
+        isbn_10 = ""
+
+        isbn_13 = ""
+
+        identificadores = info.get(
+            "industryIdentifiers",
+            [],
+        )
+
+        if isinstance(
+            identificadores,
+            list,
+        ):
+
+            for identifier in (
+                identificadores
+            ):
+
+                if not isinstance(
+                    identifier,
+                    dict,
+                ):
+                    continue
+
+                tipo = limpar(
+                    identifier.get(
+                        "type",
+                        "",
+                    )
+                )
+
+                valor = isbn_limpo(
+                    identifier.get(
+                        "identifier",
+                        "",
+                    )
+                )
+
                 if tipo == "ISBN_10":
                     isbn_10 = valor
+
                 elif tipo == "ISBN_13":
                     isbn_13 = valor
 
-    image_links = volume_info.get("imageLinks", {})
-    thumbnail = ""
-    small_thumbnail = ""
-    if isinstance(image_links, dict):
-        thumbnail = image_links.get("thumbnail", "")
-        small_thumbnail = image_links.get("smallThumbnail", "")
+        imagens = info.get(
+            "imageLinks",
+            {},
+        )
 
-    return {
-        "google_volume_id": volume.get("id", ""),
-        "google_kind": volume.get("kind", ""),
-        "search_method": metodo_busca,
-        "google_title": volume_info.get("title", ""),
-        "google_subtitle": volume_info.get("subtitle", ""),
-        "google_authors": autores,
-        "google_publisher": volume_info.get("publisher", ""),
-        "google_published_date": volume_info.get("publishedDate", ""),
-        "google_description": volume_info.get("description", ""),
-        "google_page_count": volume_info.get("pageCount", ""),
-        "google_categories": categorias,
-        "google_average_rating": volume_info.get("averageRating", ""),
-        "google_ratings_count": volume_info.get("ratingsCount", ""),
-        "google_language": volume_info.get("language", ""),
-        "google_isbn10": isbn_10,
-        "google_isbn13": isbn_13,
-        "google_maturity_rating": volume_info.get("maturityRating", ""),
-        "google_print_type": volume_info.get("printType", ""),
-        "google_text_snippet": volume_info.get("textSnippet", ""),
-        "google_thumbnail": thumbnail,
-        "google_small_thumbnail": small_thumbnail,
-        "google_preview_link": volume_info.get("previewLink", ""),
-        "google_info_link": volume_info.get("infoLink", ""),
-        "google_web_reader_link": access_info.get("webReaderLink", ""),
-        "google_viewability": access_info.get("viewability", ""),
-        "google_public_domain": access_info.get("publicDomain", ""),
-        "google_ebook_available": ("epub" in access_info or "pdf" in access_info),
-        "google_saleability": sale_info.get("saleability", ""),
-        "goodreads_book_id": str(book_id),
-        "api_source": "google_books"
-    }
+        if not isinstance(
+            imagens,
+            dict,
+        ):
+            imagens = {}
 
+        return {
+            "status":
+                "matched",
 
-# ============================================================
-# ALGORITMO DE VALIDAÇÃO CRUZADA (ANTI-HOMÔNIMOS)
-# ============================================================
+            "source":
+                "google_books",
 
-def validar_candidato(gr_title, gr_year, gr_publisher, doc):
-    """
-    Avalia a compatibilidade de um candidato retornado pela Search API
-    com os metadados do Goodreads. Retorna um score de 0 a 100.
-    """
-    score = 0
-    t_gr = normalizar_texto(gr_title)
-    t_ol = normalizar_texto(doc.get("title", ""))
+            "google_volume_id":
+                limpar(
+                    melhor.get("id")
+                ),
 
-    if not t_gr or not t_ol:
-        return 0
+            "google_title":
+                limpar(
+                    info.get("title")
+                ),
 
-    # 1. Compatibilidade de Título
-    if t_gr == t_ol:
-        score += 40
-        # Bônus para títulos específicos (>= 3 palavras)
-        if len(t_gr.split()) >= 3:
-            score += 20
-    elif t_gr in t_ol or t_ol in t_gr:
-        score += 25
-    else:
-        return 0  # Títulos incompatíveis: rejeição imediata
+            "google_subtitle":
+                limpar(
+                    info.get("subtitle")
+                ),
 
-    # 2. Compatibilidade de Ano
-    ol_year = doc.get("first_publish_year")
-    if gr_year and ol_year:
-        try:
-            diff = abs(int(gr_year) - int(ol_year))
-            if diff <= 1:
-                score += 30
-            elif diff <= 3:
-                score += 15
-            elif diff > 10:
-                score -= 25
-        except Exception:
-            pass
+            "google_authors":
+                autores,
 
-    # 3. Compatibilidade de Editora
-    ol_pubs = [normalizar_texto(p) for p in (doc.get("publisher") or [])]
-    gr_pub_norm = normalizar_texto(gr_publisher)
-    if gr_pub_norm and ol_pubs:
-        matched_pub = False
-        for p in ol_pubs:
-            if p in gr_pub_norm or gr_pub_norm in p or any(w in p for w in gr_pub_norm.split() if len(w) > 3):
-                matched_pub = True
-                break
-        if matched_pub:
-            score += 30
+            "google_publisher":
+                limpar(
+                    info.get("publisher")
+                ),
 
-    return score
+            "google_published_date":
+                limpar(
+                    info.get(
+                        "publishedDate"
+                    )
+                ),
 
+            "google_description":
+                limpar(
+                    info.get(
+                        "description"
+                    )
+                ),
 
-# ============================================================
-# FUNÇÕES DE BUSCA: GOOGLE BOOKS API
-# ============================================================
+            "google_page_count":
+                info.get(
+                    "pageCount"
+                ),
 
-def requisicao_google_books(query, api_key=None, max_retries=4):
-    parametros = {
-        "q": query,
-        "maxResults": MAX_RESULTADOS,
-        "printType": "books",
-    }
-    if api_key:
-        parametros["key"] = api_key
+            "google_categories":
+                categorias,
 
-    delay = 1.0
-    for tentativa in range(max_retries):
-        try:
-            resp = requests.get(GOOGLE_BOOKS_URL, params=parametros, timeout=TIMEOUT)
-            if resp.status_code == 200:
-                return {"status": "success", "data": resp.json()}
-            elif resp.status_code == 429:
-                texto_erro = resp.text
-                if "Queries per day" in texto_erro:
-                    return {"status": "daily_quota_exceeded", "error": texto_erro}
-                # Burst rate limit (QPS) passageiro: aguarda e tenta novamente
-                time.sleep(delay)
-                delay = min(delay * 2, 6.0)
-                continue
-            else:
-                return {"status": "error", "code": resp.status_code, "error": resp.text[:200]}
-        except Exception:
-            time.sleep(delay)
-            delay = min(delay * 2, 6.0)
+            "google_average_rating":
+                info.get(
+                    "averageRating"
+                ),
 
-    return {"status": "burst_rate_limit", "error": "Limite de rajada excedido após retentativas"}
+            "google_ratings_count":
+                info.get(
+                    "ratingsCount"
+                ),
 
+            "google_language":
+                limpar(
+                    info.get(
+                        "language"
+                    )
+                ),
 
-def buscar_livro_google(row, api_key=None):
-    """
-    Busca um livro no Google Books usando estratégias em cascata:
-    1. ISBN-13 ou ISBN-10
-    2. Título com validação cruzada anti-homônimo
-    """
-    b_id = str(row["book_id"]).strip()
-    isbn13 = limpar_valor(row.get("isbn13", ""))
-    isbn = limpar_valor(row.get("isbn", ""))
-    titulo = limpar_valor(row.get("title_without_series", "")) or limpar_valor(row.get("title", ""))
-    titulo_limpo = limpar_titulo(titulo)
+            "google_isbn10":
+                isbn_10,
 
-    # 1. Busca por ISBN (prioriza ISBN-13, senão ISBN-10)
-    isbn_busca = isbn13 or isbn
-    if isbn_busca:
-        res = requisicao_google_books(f"isbn:{isbn_busca}", api_key=api_key)
-        if res.get("status") == "daily_quota_exceeded":
-            return None, True
-        if res.get("status") == "success" and res["data"].get("items"):
-            return extrair_volume_google(res["data"]["items"][0], "google_isbn", b_id), False
+            "google_isbn13":
+                isbn_13,
 
-    # 2. Busca por Título com validação
-    if titulo_limpo:
-        res = requisicao_google_books(f'intitle:"{titulo_limpo}"', api_key=api_key)
-        if res.get("status") == "daily_quota_exceeded":
-            return None, True
-        if res.get("status") == "success" and res["data"].get("items"):
-            itens = res["data"]["items"]
-            gr_year = limpar_valor(row.get("publication_year", ""))
-            gr_pub = limpar_valor(row.get("publisher", ""))
-            melhor_item = None
-            maior_score = 0
-            for it in itens:
-                v_info = it.get("volumeInfo", {})
-                pub_date = v_info.get("publishedDate", "")
-                ano_cand = pub_date[:4] if len(pub_date) >= 4 and pub_date[:4].isdigit() else ""
-                editora_cand = [v_info.get("publisher", "")] if v_info.get("publisher") else []
-                doc_simulado = {
-                    "title": v_info.get("title", ""),
-                    "first_publish_year": ano_cand,
-                    "publisher": editora_cand
-                }
-                sc = validar_candidato(titulo_limpo, gr_year, gr_pub, doc_simulado)
-                if sc > maior_score:
-                    maior_score = sc
-                    melhor_item = it
+            "google_maturity_rating":
+                limpar(
+                    info.get(
+                        "maturityRating"
+                    )
+                ),
 
-            if melhor_item and maior_score >= 40:
-                return extrair_volume_google(melhor_item, f"google_title_score_{maior_score}", b_id), False
+            "google_print_type":
+                limpar(
+                    info.get(
+                        "printType"
+                    )
+                ),
 
-    return None, False
+            "google_thumbnail":
+                limpar(
+                    imagens.get(
+                        "thumbnail"
+                    )
+                ),
+
+            "google_small_thumbnail":
+                limpar(
+                    imagens.get(
+                        "smallThumbnail"
+                    )
+                ),
+
+            "google_preview_link":
+                limpar(
+                    info.get(
+                        "previewLink"
+                    )
+                ),
+
+            "google_info_link":
+                limpar(
+                    info.get(
+                        "infoLink"
+                    )
+                ),
+
+            "google_web_reader_link":
+                limpar(
+                    access.get(
+                        "webReaderLink"
+                    )
+                ),
+
+            "google_viewability":
+                limpar(
+                    access.get(
+                        "viewability"
+                    )
+                ),
+
+            "google_public_domain":
+                bool(
+                    access.get(
+                        "publicDomain",
+                        False,
+                    )
+                ),
+
+            "google_ebook_available":
+                bool(
+                    "epub" in access
+                    or "pdf" in access
+                ),
+
+            "google_saleability":
+                limpar(
+                    sale.get(
+                        "saleability"
+                    )
+                ),
+
+            "google_search_method":
+                metodo,
+
+            "goodreads_book_id":
+                book_id,
+        }
+
+    return None
 
 
-# ============================================================
-# ETAPA 1: BUSCA EM LOTE NA OPEN LIBRARY (POR ISBN)
-# ============================================================
+def consultar_google(
+    df_books: pd.DataFrame,
+    cache: dict[str, Any],
+) -> None:
 
-print()
-print("=" * 70)
-print("ETAPA 1: OPEN LIBRARY API (LOTE POR ISBN)")
-print("=" * 70)
+    if SKIP_GOOGLE:
 
-bibkey_to_books = {}
-for _, row in df_books.iterrows():
-    b_id = str(row["book_id"]).strip()
-    if ja_coletado(b_id):
-        continue  # PULA LIVROS JÁ COLETADOS
+        print(
+            "[Google Books] "
+            "etapa desativada."
+        )
 
-    isbn13 = limpar_valor(row.get("isbn13", ""))
-    isbn = limpar_valor(row.get("isbn", ""))
+        return
 
-    if isbn13:
-        bibkey_to_books.setdefault(f"ISBN:{isbn13}", []).append((b_id, row))
-    elif isbn:
-        bibkey_to_books.setdefault(f"ISBN:{isbn}", []).append((b_id, row))
+    pendentes = []
 
-if SKIP_OPENLIBRARY:
-    print("\n[INFO] Etapa 1 pulada (--skip-openlibrary ativo).")
-    todas_bibkeys = []
-else:
-    todas_bibkeys = list(bibkey_to_books.keys())
-    print(f"Livros pendentes com ISBN a buscar: {len(todas_bibkeys):,} chaves")
+    for _, row in df_books.iterrows():
 
-encontrados_ol = 0
-if todas_bibkeys:
-    num_lotes = (len(todas_bibkeys) + OPEN_LIBRARY_BATCH_SIZE - 1) // OPEN_LIBRARY_BATCH_SIZE
-    pbar = tqdm(range(num_lotes), desc="Consultando Open Library (Lotes)")
+        book_id = str(
+            row["book_id"]
+        ).strip()
 
-    for i in pbar:
-        batch_keys = todas_bibkeys[i * OPEN_LIBRARY_BATCH_SIZE : (i + 1) * OPEN_LIBRARY_BATCH_SIZE]
-        bibkeys_param = ",".join(batch_keys)
+        if book_id not in cache:
 
-        try:
-            resp = requests.get(
-                OPEN_LIBRARY_URL,
-                params={"bibkeys": bibkeys_param, "format": "json", "jscmd": "data"},
-                headers=OPEN_LIBRARY_HEADERS,
-                timeout=TIMEOUT
+            pendentes.append(
+                row
             )
-            if resp.status_code == 200:
-                batch_data = resp.json()
-                for key in batch_keys:
-                    if key in batch_data:
-                        dados_livro = batch_data[key]
-                        for (b_id, _) in bibkey_to_books[key]:
-                            vol = extrair_volume_openlibrary(dados_livro, b_id, metodo_busca="openlibrary_batch")
-                            cache[b_id] = vol
-                            encontrados_ol += 1
-        except Exception:
-            pass
 
-        if (i + 1) % 10 == 0:
-            salvar_cache(cache)
+    if MAX_NEW_GOOGLE_BOOKS:
 
-        time.sleep(OPEN_LIBRARY_DELAY)
-        pbar.set_postfix({"Encontrados Lote": encontrados_ol})
+        pendentes = pendentes[
+            :MAX_NEW_GOOGLE_BOOKS
+        ]
 
-    salvar_cache(cache)
-    print(f"Novos livros encontrados via lote: {encontrados_ol:,}")
-else:
-    print("Nenhum livro pendente para a Etapa 1. Todos já estavam em cache!")
+    print(
+        f"[Google Books] livros pendentes: "
+        f"{len(pendentes):,}"
+    )
 
+    if not pendentes:
+        return
 
-# ============================================================
-# ETAPA 2: OPEN LIBRARY SEARCH API (POR TÍTULO COM VALIDAÇÃO)
-# ============================================================
+    session = requests.Session()
 
-print()
-print("=" * 70)
-print("ETAPA 2: OPEN LIBRARY SEARCH API (POR TÍTULO COM VALIDAÇÃO CRUZADA)")
-print("=" * 70)
-
-livros_para_busca_titulo = []
-for _, row in df_books.iterrows():
-    b_id = str(row["book_id"]).strip()
-    if ja_coletado(b_id):
-        continue  # PULA LIVROS JÁ COLETADOS
-
-    titulo_busca = limpar_valor(row.get("title_without_series", "")) or limpar_valor(row.get("title", ""))
-    titulo_busca = limpar_titulo(titulo_busca)
-    if titulo_busca and not SKIP_OPENLIBRARY:
-        livros_para_busca_titulo.append((b_id, titulo_busca, row))
-
-if SKIP_OPENLIBRARY:
-    print("\n[INFO] Etapa 2 pulada (--skip-openlibrary ativo).")
-else:
-    print(f"Livros pendentes para busca por título: {len(livros_para_busca_titulo):,}")
-
-encontrados_ol_search = 0
-
-def buscar_e_validar_livro(item):
-    b_id, titulo_busca, row = item
-    gr_year = limpar_valor(row.get("publication_year", ""))
-    gr_pub = limpar_valor(row.get("publisher", ""))
+    encontrados = 0
 
     try:
-        r = requests.get(
-            OPEN_LIBRARY_SEARCH_URL,
-            params={
-                "title": titulo_busca,
-                "limit": 5,
-                "fields": "key,title,subtitle,author_name,first_publish_year,publisher,isbn,subject,number_of_pages_median,cover_i"
-            },
-            headers=OPEN_LIBRARY_HEADERS,
-            timeout=12
+
+        for row in tqdm(
+            pendentes,
+            desc="Google Books",
+        ):
+
+            book_id = str(
+                row["book_id"]
+            ).strip()
+
+            resultado = buscar_google(
+                session,
+                row,
+            )
+
+            if (
+                resultado
+                and resultado.get(
+                    "status"
+                )
+                == "matched"
+            ):
+
+                cache[
+                    book_id
+                ] = resultado
+
+                encontrados += 1
+
+            elif (
+                resultado
+                and resultado.get(
+                    "status"
+                )
+                == "rate_limited"
+            ):
+
+                print(
+                    "[Google Books] "
+                    "HTTP 429 persistente. "
+                    "Interrompendo a etapa."
+                )
+
+                # O livro atual NÃO é colocado no cache.
+                # Assim ele será novamente tentado na próxima execução.
+                break
+
+            # Delay entre livros.
+            time.sleep(
+                GOOGLE_DELAY
+            )
+
+            if (
+                encontrados
+                and encontrados
+                % CACHE_SAVE_EVERY
+                == 0
+            ):
+
+                salvar_json(
+                    ARQUIVO_CACHE_GOOGLE,
+                    cache,
+                )
+
+    except KeyboardInterrupt:
+
+        print(
+            "\n[Google Books] "
+            "Interrupção detectada. "
+            "Salvando cache..."
         )
-        if r.status_code == 200:
-            docs = r.json().get("docs", [])
-            melhor_doc = None
-            maior_score = 0
 
-            for doc in docs:
-                # Exige que tenha autor
-                if not doc.get("author_name"):
-                    continue
-                score = validar_candidato(titulo_busca, gr_year, gr_pub, doc)
-                if score > maior_score:
-                    maior_score = score
-                    melhor_doc = doc
+        salvar_json(
+            ARQUIVO_CACHE_GOOGLE,
+            cache,
+        )
 
-            if melhor_doc and maior_score >= THRESHOLD_VALIDACAO:
-                vol = extrair_volume_openlibrary_search(melhor_doc, b_id, score_validacao=maior_score)
-                return b_id, vol
-    except Exception:
-        pass
+        raise
 
-    return b_id, None
+    except Exception as erro:
 
+        print(
+            f"[Google Books] "
+            f"Erro inesperado: {erro}"
+        )
 
-if livros_para_busca_titulo:
-    pbar_search = tqdm(total=len(livros_para_busca_titulo), desc="Buscando por Título (Open Library)")
+        salvar_json(
+            ARQUIVO_CACHE_GOOGLE,
+            cache,
+        )
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS_SEARCH) as executor:
-        futures = {executor.submit(buscar_e_validar_livro, item): item for item in livros_para_busca_titulo}
+    finally:
 
-        for i, future in enumerate(concurrent.futures.as_completed(futures)):
-            try:
-                b_id, vol = future.result()
-                if vol:
-                    cache[b_id] = vol
-                    encontrados_ol_search += 1
-            except Exception:
-                pass
+        salvar_json(
+            ARQUIVO_CACHE_GOOGLE,
+            cache,
+        )
 
-            pbar_search.update(1)
-            pbar_search.set_postfix({"Encontrados Busca": encontrados_ol_search})
-
-            if (i + 1) % 25 == 0:
-                salvar_cache(cache)
-
-    salvar_cache(cache)
-    print(f"\nBusca por título concluída. Novos livros validados e salvos: {encontrados_ol_search:,}")
-else:
-    print("Nenhum livro pendente para busca por título. Todos já estavam em cache!")
-
-
-# ============================================================
-# ETAPA 2.1: PREENCHER ISBNS PARA LIVROS ENCONTRADOS POR TÍTULO
-# ============================================================
-
-livros_precisando_isbn = []
-for b_id, item in cache.items():
-    if item and item.get("api_source") == "openlibrary_search":
-        if not item.get("google_isbn13") and not item.get("google_isbn10"):
-            livros_precisando_isbn.append((b_id, item.get("google_title", "")))
-
-if livros_precisando_isbn:
-    print(f"\n[INFO] Recuperando ISBNs para {len(livros_precisando_isbn):,} livros resgatados por título...")
-    pbar_isbn = tqdm(total=len(livros_precisando_isbn), desc="Recuperando ISBNs")
-    isbns_recuperados = 0
-
-    def buscar_isbn_titulo(par):
-        b_id, tit = par
-        if not tit:
-            return b_id, "", ""
-        try:
-            r = requests.get(
-                OPEN_LIBRARY_SEARCH_URL,
-                params={"title": tit, "limit": 1, "fields": "title,isbn"},
-                headers=OPEN_LIBRARY_HEADERS,
-                timeout=10
-            )
-            if r.status_code == 200:
-                docs = r.json().get("docs", [])
-                if docs and docs[0].get("isbn"):
-                    isbns = docs[0]["isbn"]
-                    i13 = next((str(x).strip() for x in isbns if len(re.sub(r"[^0-9X]", "", str(x).strip())) == 13), "")
-                    i10 = next((str(x).strip() for x in isbns if len(re.sub(r"[^0-9X]", "", str(x).strip())) == 10), "")
-                    return b_id, i13, i10
-        except Exception:
-            pass
-        return b_id, "", ""
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS_SEARCH) as ex:
-        futures = {ex.submit(buscar_isbn_titulo, item): item for item in livros_precisando_isbn}
-        for i, fut in enumerate(concurrent.futures.as_completed(futures)):
-            try:
-                b_id, i13, i10 = fut.result()
-                if i13 or i10:
-                    if b_id in cache and cache[b_id]:
-                        cache[b_id]["google_isbn13"] = i13
-                        cache[b_id]["google_isbn10"] = i10
-                        isbns_recuperados += 1
-            except Exception:
-                pass
-            pbar_isbn.update(1)
-            pbar_isbn.set_postfix({"ISBNs OK": isbns_recuperados})
-            if (i + 1) % 50 == 0:
-                salvar_cache(cache)
-
-    salvar_cache(cache)
-    print(f"\nISBNs recuperados com sucesso: {isbns_recuperados:,}")
-else:
-    print("Todos os livros resgatados já possuem ISBN!")
-
-
-# ============================================================
-# ETAPA 2.2: ATUALIZAR METADADOS VIA LOTE USANDO OS ISBNS RECUPERADOS
-# ============================================================
-
-bibkeys_para_atualizar = {}
-for b_id, item in cache.items():
-    if item and item.get("api_source") == "openlibrary_search":
-        isbn13 = item.get("google_isbn13", "").strip()
-        isbn10 = item.get("google_isbn10", "").strip()
-        if isbn13:
-            bibkeys_para_atualizar.setdefault(f"ISBN:{isbn13}", []).append(b_id)
-        elif isbn10:
-            bibkeys_para_atualizar.setdefault(f"ISBN:{isbn10}", []).append(b_id)
-
-if bibkeys_para_atualizar:
-    print(f"\n[INFO] Atualizando metadados completos em lote para {len(bibkeys_para_atualizar):,} ISBNs recuperados...")
-    chaves_lista = list(bibkeys_para_atualizar.keys())
-    num_lotes_att = (len(chaves_lista) + OPEN_LIBRARY_BATCH_SIZE - 1) // OPEN_LIBRARY_BATCH_SIZE
-    pbar_att = tqdm(range(num_lotes_att), desc="Atualizando Metadados em Lote")
-    metadados_atualizados = 0
-
-    for idx in pbar_att:
-        lote = chaves_lista[idx * OPEN_LIBRARY_BATCH_SIZE : (idx + 1) * OPEN_LIBRARY_BATCH_SIZE]
-        param_bibkeys = ",".join(lote)
-        try:
-            resp = requests.get(
-                OPEN_LIBRARY_URL,
-                params={"bibkeys": param_bibkeys, "format": "json", "jscmd": "data"},
-                headers=OPEN_LIBRARY_HEADERS,
-                timeout=TIMEOUT
-            )
-            if resp.status_code == 200:
-                dados_resp = resp.json()
-                for bk in lote:
-                    if bk in dados_resp:
-                        info_livro = dados_resp[bk]
-                        for b_id in bibkeys_para_atualizar[bk]:
-                            vol_completo = extrair_volume_openlibrary(info_livro, b_id, metodo_busca="openlibrary_batch_recovered_isbn")
-                            if not vol_completo.get("google_isbn13"):
-                                vol_completo["google_isbn13"] = cache[b_id].get("google_isbn13", "")
-                            if not vol_completo.get("google_isbn10"):
-                                vol_completo["google_isbn10"] = cache[b_id].get("google_isbn10", "")
-                            cache[b_id] = vol_completo
-                            metadados_atualizados += 1
-        except Exception:
-            pass
-
-        time.sleep(OPEN_LIBRARY_DELAY)
-        pbar_att.set_postfix({"Metadados Atualizados": metadados_atualizados})
-
-    salvar_cache(cache)
-    print(f"\nMetadados detalhados atualizados com sucesso: {metadados_atualizados:,}")
-else:
-    print("Nenhum metadado pendente para atualização em lote.")
-
-
-# ============================================================
-# ETAPA 2.3: COLETAR NOTAS DA OPEN LIBRARY (RATINGS)
-# ============================================================
-
-isbn_to_bids_rating = {}
-for b_id, item in cache.items():
-    if item and (item.get("google_average_rating") is None or item.get("google_average_rating") == ""):
-        i13 = re.sub(r"[^0-9X]", "", str(item.get("google_isbn13", "")).strip().upper())
-        i10 = re.sub(r"[^0-9X]", "", str(item.get("google_isbn10", "")).strip().upper())
-        if len(i13) == 13:
-            isbn_to_bids_rating.setdefault(i13, []).append(b_id)
-        elif len(i10) == 10:
-            isbn_to_bids_rating.setdefault(i10, []).append(b_id)
-
-if isbn_to_bids_rating:
-    all_isbns_rating = list(isbn_to_bids_rating.keys())
-    print(f"\n[INFO] Coletando notas da Open Library para {len(all_isbns_rating):,} ISBNs...")
-    batch_size_rat = 40
-    batches_rat = [all_isbns_rating[i : i + batch_size_rat] for i in range(0, len(all_isbns_rating), batch_size_rat)]
-    pbar_rat = tqdm(total=len(batches_rat), desc="Coletando Notas da Open Library")
-    notas_coletadas = 0
-
-    def fetch_batch_ratings(batch):
-        q_isbns = " OR ".join(batch)
-        try:
-            r = requests.get(
-                OPEN_LIBRARY_SEARCH_URL,
-                params={"q": f"isbn:({q_isbns})", "fields": "key,isbn,ratings_average,ratings_count", "limit": 60},
-                headers=OPEN_LIBRARY_HEADERS,
-                timeout=15
-            )
-            if r.status_code == 200:
-                return r.json().get("docs", [])
-        except Exception:
-            pass
-        return []
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS_SEARCH) as ex:
-        futures = {ex.submit(fetch_batch_ratings, b): b for b in batches_rat}
-        for fut in concurrent.futures.as_completed(futures):
-            docs = fut.result()
-            for doc in docs:
-                avg_rating = doc.get("ratings_average")
-                count_rating = doc.get("ratings_count")
-                if avg_rating is not None:
-                    doc_isbns = [re.sub(r"[^0-9X]", "", str(x).strip().upper()) for x in doc.get("isbn", [])]
-                    matched_bids = set()
-                    for i_code in doc_isbns:
-                        if i_code in isbn_to_bids_rating:
-                            for b_id in isbn_to_bids_rating[i_code]:
-                                matched_bids.add(b_id)
-                    for b_id in matched_bids:
-                        if b_id in cache and cache[b_id]:
-                            cache[b_id]["google_average_rating"] = round(float(avg_rating), 2)
-                            cache[b_id]["google_ratings_count"] = int(count_rating or 0)
-                            notas_coletadas += 1
-            pbar_rat.update(1)
-            pbar_rat.set_postfix({"Notas Encontradas": notas_coletadas})
-
-    salvar_cache(cache)
-    print(f"\nNotas da Open Library atribuídas com sucesso: {notas_coletadas:,}")
-else:
-    print("Todas as notas da Open Library já foram coletadas anteriormente!")
-
-
-# ============================================================
-# ETAPA 3: FALLBACK GOOGLE BOOKS API (OPCIONAL)
-# ============================================================
-
-print()
-print("=" * 70)
-print("ETAPA 3: FALLBACK GOOGLE BOOKS API")
-print("=" * 70)
-
-livros_pendentes_google = []
-for _, row in df_books.iterrows():
-    b_id = str(row["book_id"]).strip()
-    if ja_coletado(b_id):
-        continue  # PULA LIVROS JÁ COLETADOS
-    livros_pendentes_google.append(row)
-
-print(f"Livros ainda não enriquecidos: {len(livros_pendentes_google):,}")
-
-encontrados_google = 0
-
-if not livros_pendentes_google:
-    print("\n[INFO] Todos os livros já foram resolvidos nas etapas anteriores!")
-else:
-    if not API_KEY:
-        print("\n[AVISO] GOOGLE_BOOKS_API_KEY não informada no ambiente.")
-        print("Tentando consulta pública (sujeita a cota diária do IP no Google)...")
-    else:
-        print("\n[INFO] Usando chave configurada em GOOGLE_BOOKS_API_KEY.")
-
-    pbar_google = tqdm(total=len(livros_pendentes_google), desc="Consultando Google Books")
-    rate_limit_atingido = False
-
-    def processar_livro_google(row):
-        global rate_limit_atingido
-        if rate_limit_atingido:
-            return None, None, False
-        b_id = str(row["book_id"]).strip()
-        vol, rate_limited = buscar_livro_google(row, api_key=API_KEY)
-        if rate_limited:
-            rate_limit_atingido = True
-        time.sleep(0.05)
-        return b_id, vol, rate_limited
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-        futures = {executor.submit(processar_livro_google, row): row for row in livros_pendentes_google}
-        for i, fut in enumerate(concurrent.futures.as_completed(futures)):
-            try:
-                b_id, vol, rate_limited = fut.result()
-                if rate_limited and rate_limit_atingido:
-                    print("\n\n" + "!" * 70)
-                    print("[AVISO] GOOGLE BOOKS API RETORNOU HTTP 429 (QUOTA DIÁRIA EXCEDIDA)")
-                    print("A cota diária de 1.000 requisições da chave no Google Cloud foi atingida.")
-                    print("!" * 70 + "\n")
-                    for f in futures:
-                        f.cancel()
-                    break
-                if vol:
-                    cache[b_id] = vol
-                    encontrados_google += 1
-            except Exception:
-                pass
-
-            pbar_google.update(1)
-            pbar_google.set_postfix({"Encontrados Google": encontrados_google})
-
-            if (i + 1) % 25 == 0:
-                salvar_cache(cache)
-
-    salvar_cache(cache)
-    print(f"\nEtapa Google Books concluída. Livros enriquecidos pelo Google: {encontrados_google:,}")
-
-
-# ============================================================
-# ETAPA 4: CONSOLIDAR DATASETS FINAIS
-# ============================================================
-
-print()
-print("=" * 70)
-print("CONSOLIDANDO DATASET ENRIQUECIDO")
-print("=" * 70)
-
-resultados = []
-for _, row in df_books.iterrows():
-    b_id = str(row["book_id"]).strip()
-    val = cache.get(b_id)
-    if val:
-        val["goodreads_book_id"] = b_id
-        resultados.append(val)
-
-df_enriquecido_api = pd.DataFrame(resultados)
-
-if len(df_enriquecido_api) > 0:
-    df_enriquecido_api = df_enriquecido_api.drop_duplicates(subset=["goodreads_book_id"])
-    df_enriquecido_api["goodreads_book_id"] = df_enriquecido_api["goodreads_book_id"].astype(str).str.strip()
-    df_books["book_id"] = df_books["book_id"].astype(str).str.strip()
-
-    # Normalizar tipos de colunas para PyArrow / Parquet
-    for col in ["google_page_count", "google_average_rating", "google_ratings_count"]:
-        if col in df_enriquecido_api.columns:
-            df_enriquecido_api[col] = pd.to_numeric(df_enriquecido_api[col], errors="coerce")
-
-    for col in ["google_public_domain", "google_ebook_available"]:
-        if col in df_enriquecido_api.columns:
-            df_enriquecido_api[col] = df_enriquecido_api[col].astype(bool)
-
-    for col in df_enriquecido_api.columns:
-        if col not in ["google_page_count", "google_average_rating", "google_ratings_count", "google_public_domain", "google_ebook_available"]:
-            df_enriquecido_api[col] = df_enriquecido_api[col].fillna("").astype(str)
-
-    df_books_completo = df_books.merge(
-        df_enriquecido_api,
-        left_on="book_id",
-        right_on="goodreads_book_id",
-        how="left"
+    print(
+        f"[Google Books] novos matches: "
+        f"{encontrados:,}"
     )
-else:
-    df_books_completo = df_books.copy()
-
-# Salvar arquivo intermediário de livros enriquecidos
-df_enriquecido_api.to_parquet(ARQUIVO_GOOGLE_BOOKS, index=False)
-print(f"Dados enriquecidos salvos em:\n{ARQUIVO_GOOGLE_BOOKS}")
-
-# Cruzar com reviews
-print("\nCruzando com reviews...")
-df_reviews["book_id"] = df_reviews["book_id"].astype(str).str.strip()
-df_books_completo["book_id"] = df_books_completo["book_id"].astype(str).str.strip()
-
-df_final = df_reviews.merge(
-    df_books_completo,
-    on="book_id",
-    how="left",
-    suffixes=("", "_book")
-)
-
-# Salvar dataset final
-df_final.to_parquet(ARQUIVO_FINAL, index=False)
-print(f"Dataset final salvo em:\n{ARQUIVO_FINAL}")
 
 
 # ============================================================
-# ESTATÍSTICAS FINAIS
+# CONSOLIDAÇÃO
 # ============================================================
 
-total_livros = len(df_books)
-total_enriquecidos = len(df_enriquecido_api)
-total_reviews = len(df_reviews)
+def records_from_cache(
+    df_books: pd.DataFrame,
+    cache_openlibrary: dict[str, Any],
+    cache_google: dict[str, Any],
+) -> pd.DataFrame:
 
-reviews_com_enriquecimento = 0
-if "google_volume_id" in df_final.columns:
-    reviews_com_enriquecimento = df_final["google_volume_id"].notna().sum()
+    registros = []
 
-taxa_livros = (total_enriquecidos / total_livros * 100) if total_livros > 0 else 0
-taxa_reviews = (reviews_com_enriquecimento / total_reviews * 100) if total_reviews > 0 else 0
+    for _, row in df_books.iterrows():
 
-fontes = df_enriquecido_api["api_source"].value_counts().to_dict() if "api_source" in df_enriquecido_api.columns else {}
+        book_id = str(
+            row["book_id"]
+        ).strip()
 
-print()
-print("=" * 70)
-print("RESUMO DO ENRIQUECIMENTO")
-print("=" * 70)
-print(f"Total de livros Goodreads:         {total_livros:,}")
-print(f"Livros enriquecidos com sucesso:    {total_enriquecidos:,} ({taxa_livros:.2f}%)")
-for fonte, contagem in fontes.items():
-    print(f"  - Fonte '{fonte}': {contagem:,} livros")
-print(f"Total de reviews:                  {total_reviews:,}")
-print(f"Reviews com metadados externos:    {reviews_com_enriquecimento:,} ({taxa_reviews:.2f}%)")
-print("=" * 70)
-print("PROCESSO CONCLUÍDO COM SUCESSO!")
-print("=" * 70)
+        registro = {
+            "book_id":
+                book_id,
+
+            "openlibrary_match":
+                False,
+
+            "openlibrary_status":
+                "not_found",
+
+            "google_match":
+                False,
+
+            "google_status":
+                "not_found",
+        }
+
+        ol = cache_openlibrary.get(
+            book_id
+        )
+
+        if isinstance(
+            ol,
+            dict,
+        ):
+
+            registro.update(
+                {
+                    chave: valor
+                    for chave, valor
+                    in ol.items()
+                    if (
+                        chave.startswith(
+                            "openlibrary_"
+                        )
+                        or chave == "status"
+                    )
+                }
+            )
+
+            registro[
+                "openlibrary_match"
+            ] = (
+                ol.get("status")
+                == "matched"
+            )
+
+            registro[
+                "openlibrary_status"
+            ] = ol.get(
+                "status",
+                "unknown",
+            )
+
+        gb = cache_google.get(
+            book_id
+        )
+
+        if isinstance(
+            gb,
+            dict,
+        ):
+
+            registro.update(
+                {
+                    chave: valor
+                    for chave, valor
+                    in gb.items()
+                    if chave.startswith(
+                        "google_"
+                    )
+                }
+            )
+
+            registro[
+                "google_match"
+            ] = (
+                gb.get("status")
+                == "matched"
+            )
+
+            registro[
+                "google_status"
+            ] = gb.get(
+                "status",
+                "unknown",
+            )
+
+        registros.append(
+            registro
+        )
+
+    return pd.DataFrame(
+        registros
+    )
+
+
+# ============================================================
+# FALLBACK
+# ============================================================
+
+def preencher_fallback(
+    df: pd.DataFrame,
+    destino: str,
+    *fontes: str,
+) -> None:
+
+    resultado = pd.Series(
+        pd.NA,
+        index=df.index,
+        dtype="object",
+    )
+
+    for fonte in fontes:
+
+        if fonte not in df.columns:
+            continue
+
+        serie = df[fonte]
+
+        vazios = (
+            resultado.isna()
+            | resultado.astype(
+                "string"
+            )
+            .str.strip()
+            .eq("")
+        )
+
+        resultado.loc[
+            vazios
+        ] = serie.loc[vazios]
+
+    df[destino] = resultado
+
+
+# ============================================================
+# NORMALIZAÇÃO PARA PARQUET
+# ============================================================
+
+def normalizar_tipos_para_parquet(
+    livros: pd.DataFrame,
+    reviews: pd.DataFrame,
+) -> tuple[
+    pd.DataFrame,
+    pd.DataFrame,
+]:
+
+    # --------------------------------------------------------
+    # Inteiros
+    # --------------------------------------------------------
+
+    colunas_inteiras = [
+        "openlibrary_pages",
+        "google_page_count",
+        "google_ratings_count",
+        "num_pages",
+        "pages_consolidated",
+    ]
+
+    for coluna in colunas_inteiras:
+
+        if coluna in livros.columns:
+
+            livros[coluna] = (
+                pd.to_numeric(
+                    livros[coluna],
+                    errors="coerce",
+                )
+                .astype("Int64")
+            )
+
+        if coluna in reviews.columns:
+
+            reviews[coluna] = (
+                pd.to_numeric(
+                    reviews[coluna],
+                    errors="coerce",
+                )
+                .astype("Int64")
+            )
+
+    # --------------------------------------------------------
+    # Floats
+    # --------------------------------------------------------
+
+    colunas_float = [
+        "google_average_rating",
+    ]
+
+    for coluna in colunas_float:
+
+        if coluna in livros.columns:
+
+            livros[coluna] = (
+                pd.to_numeric(
+                    livros[coluna],
+                    errors="coerce",
+                )
+            )
+
+        if coluna in reviews.columns:
+
+            reviews[coluna] = (
+                pd.to_numeric(
+                    reviews[coluna],
+                    errors="coerce",
+                )
+            )
+
+    # --------------------------------------------------------
+    # Booleanos
+    # --------------------------------------------------------
+
+    colunas_bool = [
+        "google_public_domain",
+        "google_ebook_available",
+        "openlibrary_match",
+        "google_match",
+    ]
+
+    for coluna in colunas_bool:
+
+        if coluna in livros.columns:
+
+            livros[coluna] = (
+                livros[coluna]
+                .fillna(False)
+                .astype(bool)
+            )
+
+        if coluna in reviews.columns:
+
+            reviews[coluna] = (
+                reviews[coluna]
+                .fillna(False)
+                .astype(bool)
+            )
+
+    return (
+        livros,
+        reviews,
+    )
+
+
+# ============================================================
+# DIAGNÓSTICO DE TIPOS MISTOS
+# ============================================================
+
+def verificar_colunas_object(
+    df: pd.DataFrame,
+    nome: str,
+) -> None:
+
+    for coluna in df.select_dtypes(
+        include=["object"]
+    ).columns:
+
+        valores = df[coluna].dropna()
+
+        if valores.empty:
+            continue
+
+        tipos = {
+            type(valor).__name__
+            for valor in valores
+        }
+
+        if len(tipos) > 1:
+
+            print(
+                f"[Aviso] {nome}.{coluna}: "
+                f"tipos mistos encontrados: "
+                f"{sorted(tipos)}"
+            )
+
+
+# ============================================================
+# SALVAR SAÍDAS
+# ============================================================
+
+def salvar_saidas(
+    df_books: pd.DataFrame,
+    df_reviews: pd.DataFrame,
+    cache_openlibrary: dict[str, Any],
+    cache_google: dict[str, Any],
+) -> None:
+
+    api_df = records_from_cache(
+        df_books,
+        cache_openlibrary,
+        cache_google,
+    )
+
+    livros = df_books.copy()
+
+    livros["book_id"] = (
+        livros["book_id"]
+        .astype(str)
+        .str.strip()
+    )
+
+    livros = livros.merge(
+        api_df,
+        on="book_id",
+        how="left",
+    )
+
+    # --------------------------------------------------------
+    # Fallback de páginas
+    # --------------------------------------------------------
+
+    preencher_fallback(
+        livros,
+        "pages_consolidated",
+        "num_pages",
+        "google_page_count",
+        "openlibrary_pages",
+    )
+
+    # --------------------------------------------------------
+    # Fallback de idioma
+    # --------------------------------------------------------
+
+    preencher_fallback(
+        livros,
+        "language_consolidated",
+        "language_code",
+        "google_language",
+        "openlibrary_languages",
+    )
+
+    # --------------------------------------------------------
+    # Fallback de editora
+    # --------------------------------------------------------
+
+    preencher_fallback(
+        livros,
+        "publisher_consolidated",
+        "publisher",
+        "google_publisher",
+        "openlibrary_publishers",
+    )
+
+    # --------------------------------------------------------
+    # Reviews
+    # --------------------------------------------------------
+
+    reviews = df_reviews.copy()
+
+    reviews["book_id"] = (
+        reviews["book_id"]
+        .astype(str)
+        .str.strip()
+    )
+
+    colunas_api = [
+        coluna
+        for coluna in api_df.columns
+        if coluna != "book_id"
+    ]
+
+    reviews = reviews.merge(
+        api_df[
+            ["book_id"]
+            + colunas_api
+        ],
+        on="book_id",
+        how="left",
+    )
+
+    # --------------------------------------------------------
+    # Normalização antes do Parquet
+    # --------------------------------------------------------
+
+    livros, reviews = (
+        normalizar_tipos_para_parquet(
+            livros,
+            reviews,
+        )
+    )
+
+    # --------------------------------------------------------
+    # Diagnóstico
+    # --------------------------------------------------------
+
+    verificar_colunas_object(
+        livros,
+        "livros",
+    )
+
+    verificar_colunas_object(
+        reviews,
+        "reviews",
+    )
+
+    # --------------------------------------------------------
+    # Salvamento
+    # --------------------------------------------------------
+
+    livros.to_parquet(
+        ARQUIVO_BOOKS_ENRIQUECIDO,
+        index=False,
+    )
+
+    reviews.to_parquet(
+        ARQUIVO_REVIEWS_ENRIQUECIDO,
+        index=False,
+    )
+
+    print(
+        f"\nLivros salvos em:\n"
+        f"{ARQUIVO_BOOKS_ENRIQUECIDO}"
+    )
+
+    print(
+        f"Reviews salvas em:\n"
+        f"{ARQUIVO_REVIEWS_ENRIQUECIDO}"
+    )
+
+
+# ============================================================
+# ESTATÍSTICAS
+# ============================================================
+
+def contar_matches(
+    cache: dict[str, Any],
+) -> int:
+
+    return sum(
+        1
+        for item in cache.values()
+        if (
+            isinstance(
+                item,
+                dict,
+            )
+            and item.get(
+                "status"
+            )
+            == "matched"
+        )
+    )
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main() -> None:
+
+    PASTA_PROCESSED.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    print("=" * 70)
+
+    print(
+        "03 - GOODREADS + OPEN LIBRARY + GOOGLE BOOKS"
+    )
+
+    print("=" * 70)
+
+    # --------------------------------------------------------
+    # Verificação dos arquivos
+    # --------------------------------------------------------
+
+    if not ARQUIVO_BOOKS.exists():
+
+        raise FileNotFoundError(
+            f"Arquivo não encontrado:\n"
+            f"{ARQUIVO_BOOKS}"
+        )
+
+    if not ARQUIVO_REVIEWS.exists():
+
+        raise FileNotFoundError(
+            f"Arquivo não encontrado:\n"
+            f"{ARQUIVO_REVIEWS}"
+        )
+
+    # --------------------------------------------------------
+    # Leitura
+    # --------------------------------------------------------
+
+    df_books = pd.read_parquet(
+        ARQUIVO_BOOKS
+    )
+
+    df_reviews = pd.read_parquet(
+        ARQUIVO_REVIEWS
+    )
+
+    if "book_id" not in df_books.columns:
+
+        raise ValueError(
+            "A base de livros não possui "
+            "book_id."
+        )
+
+    print(
+        f"Livros: "
+        f"{len(df_books):,}"
+    )
+
+    print(
+        f"Reviews: "
+        f"{len(df_reviews):,}"
+    )
+
+    # --------------------------------------------------------
+    # Migração / carregamento dos caches
+    # --------------------------------------------------------
+
+    (
+        cache_openlibrary,
+        cache_google,
+    ) = migrar_caches()
+
+    print(
+        f"Cache Open Library: "
+        f"{len(cache_openlibrary):,}"
+    )
+
+    print(
+        f"Cache Google Books: "
+        f"{len(cache_google):,}"
+    )
+
+    # --------------------------------------------------------
+    # Execução
+    # --------------------------------------------------------
+
+    if not ONLY_MIGRATE:
+
+        # ================================================
+        # Open Library por ISBN
+        # ================================================
+
+        consultar_openlibrary_batch(
+            df_books,
+            cache_openlibrary,
+        )
+
+        # ================================================
+        # Open Library por título
+        # ================================================
+
+        consultar_openlibrary_titulos(
+            df_books,
+            cache_openlibrary,
+        )
+
+        # ================================================
+        # Google Books
+        # ================================================
+
+        consultar_google(
+            df_books,
+            cache_google,
+        )
+
+    # --------------------------------------------------------
+    # Salvar resultados consolidados
+    # --------------------------------------------------------
+
+    salvar_saidas(
+        df_books,
+        df_reviews,
+        cache_openlibrary,
+        cache_google,
+    )
+
+    # --------------------------------------------------------
+    # Estatísticas
+    # --------------------------------------------------------
+
+    livros_ol = contar_matches(
+        cache_openlibrary
+    )
+
+    livros_google = contar_matches(
+        cache_google
+    )
+
+    print(
+        "\n"
+        + "=" * 70
+    )
+
+    print("RESUMO")
+
+    print(
+        "=" * 70
+    )
+
+    if len(df_books):
+
+        print(
+            f"Open Library: "
+            f"{livros_ol:,} "
+            f"/ {len(df_books):,} "
+            f"("
+            f"{livros_ol / len(df_books) * 100:.2f}%"
+            f")"
+        )
+
+        print(
+            f"Google Books: "
+            f"{livros_google:,} "
+            f"/ {len(df_books):,} "
+            f"("
+            f"{livros_google / len(df_books) * 100:.2f}%"
+            f")"
+        )
+
+    else:
+
+        print(
+            "Open Library: 0"
+        )
+
+        print(
+            "Google Books: 0"
+        )
+
+    print(
+        "\nIMPORTANTE:"
+    )
+
+    print(
+        "Os resultados ainda serão auditados "
+        "pelo 04_validar_matches.py."
+    )
+
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
+
+if __name__ == "__main__":
+
+    try:
+
+        main()
+
+    except KeyboardInterrupt:
+
+        print(
+            "\nExecução interrompida pelo usuário."
+        )
+
+        sys.exit(130)
+
+    except Exception as erro:
+
+        print(
+            "\nERRO FATAL:"
+        )
+
+        print(
+            repr(erro)
+        )
+
+        sys.exit(1)
+
