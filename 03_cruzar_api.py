@@ -98,7 +98,7 @@ ARQUIVO_CACHE_OPENLIBRARY = (
 # Cache independente Google Books.
 ARQUIVO_CACHE_GOOGLE = (
     PASTA_PROCESSED
-    / "google_books_cache_v2.json"
+    / "google_books_cache_v3.json"
 )
 
 
@@ -154,7 +154,7 @@ GOOGLE_DELAY = 0.50
 
 GOOGLE_TIMEOUT = 20
 
-GOOGLE_MAX_RESULTS = 5
+GOOGLE_MAX_RESULTS = 10
 
 
 # ============================================================
@@ -181,7 +181,7 @@ BACKOFF_JITTER = 0.25
 
 MAX_NEW_OPENLIBRARY_BOOKS = 1000
 
-MAX_NEW_GOOGLE_BOOKS = 1000
+MAX_NEW_GOOGLE_BOOKS = 0
 
 
 # ============================================================
@@ -1997,85 +1997,176 @@ def consultar_openlibrary_titulos(
 # GOOGLE BOOKS
 # ============================================================
 
+def extrair_ano(valor: Any) -> int | None:
+    texto = limpar(valor)
+    if not texto:
+        return None
+    match = re.search(r"\b(1[5-9]\d{2}|20\d{2}|21\d{2})\b", texto)
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return None
+
+
+def isbns_google(info: dict[str, Any]) -> tuple[str, str]:
+    isbn10 = ""
+    isbn13 = ""
+    identificadores = info.get("industryIdentifiers", [])
+
+    if isinstance(identificadores, list):
+        for identifier in identificadores:
+            if not isinstance(identifier, dict):
+                continue
+            tipo = limpar(identifier.get("type"))
+            valor = isbn_limpo(identifier.get("identifier"))
+            if tipo == "ISBN_10" and valor:
+                isbn10 = valor
+            elif tipo == "ISBN_13" and valor:
+                isbn13 = valor
+
+    return isbn10, isbn13
+
+
+def score_google_volume(
+    row: pd.Series,
+    item: dict[str, Any],
+    metodo: str,
+    rank: int,
+) -> tuple[float, dict[str, Any]]:
+    info = item.get("volumeInfo", {})
+    if not isinstance(info, dict):
+        return -1.0, {}
+
+    titulo_gr = (
+        limpar(row.get("title_without_series"))
+        or limpar(row.get("title"))
+    )
+    autor_gr = primeiro_autor(row.get("authors"))
+    editora_gr = limpar(row.get("publisher"))
+    ano_gr = extrair_ano(row.get("publication_year"))
+    isbn13_gr = isbn_limpo(row.get("isbn13"))
+    isbn10_gr = isbn_limpo(row.get("isbn"))
+
+    titulo_g = limpar(info.get("title"))
+    autores_g = info.get("authors", [])
+    autores_g = autores_g if isinstance(autores_g, list) else []
+    editora_g = limpar(info.get("publisher"))
+    ano_g = extrair_ano(info.get("publishedDate"))
+    isbn10_g, isbn13_g = isbns_google(info)
+
+    sim_titulo = similaridade(titulo_gr, titulo_g)
+    sim_autor = 0.0
+    for autor in autores_g[:10]:
+        sim_autor = max(sim_autor, similaridade(autor_gr, autor))
+
+    sim_editora = similaridade(editora_gr, editora_g) if editora_gr and editora_g else 0.0
+
+    isbn_exato = False
+    if isbn13_gr and isbn13_g and isbn13_gr == isbn13_g:
+        isbn_exato = True
+    if isbn10_gr and isbn10_g and isbn10_gr == isbn10_g:
+        isbn_exato = True
+
+    isbn_conflito = False
+    if isbn13_gr and isbn13_g and isbn13_gr != isbn13_g:
+        isbn_conflito = True
+    if isbn10_gr and isbn10_g and isbn10_gr != isbn10_g:
+        isbn_conflito = True
+
+    ano_diff = None
+    if ano_gr is not None and ano_g is not None:
+        ano_diff = abs(ano_gr - ano_g)
+
+    # O score é deliberadamente dominado por ISBN exato; depois título/autor;
+    # ano e editora entram como evidência complementar.
+    score = 0.0
+    score += 62.0 * sim_titulo
+    score += 25.0 * sim_autor
+    score += 8.0 * sim_editora
+
+    if ano_diff is not None:
+        if ano_diff == 0:
+            score += 5.0
+        elif ano_diff <= 1:
+            score += 4.0
+        elif ano_diff <= 3:
+            score += 2.0
+        elif ano_diff > 10:
+            score -= 8.0
+
+    if isbn_exato:
+        score += 100.0
+    elif isbn_conflito:
+        score -= 40.0
+
+    # O rank é só desempate leve; os metadados, e não a posição retornada pela API,
+    # determinam o candidato final.
+    score += max(0.0, 1.0 - rank * 0.05)
+
+    sinais = {
+        "title_similarity": round(sim_titulo, 4),
+        "author_similarity": round(sim_autor, 4),
+        "publisher_similarity": round(sim_editora, 4),
+        "year_difference": ano_diff,
+        "isbn_exact": isbn_exato,
+        "isbn_conflict": isbn_conflito,
+        "candidate_rank": rank,
+        "query_method": metodo,
+    }
+    return score, sinais
+
+
 def buscar_google(
     session: requests.Session,
     row: pd.Series,
 ) -> dict[str, Any] | None:
+    book_id = str(row["book_id"]).strip()
 
-    book_id = str(
-        row["book_id"]
-    ).strip()
+    isbn13 = isbn_limpo(row.get("isbn13"))
+    isbn10 = isbn_limpo(row.get("isbn"))
+    titulo = limpar(row.get("title_without_series")) or limpar(row.get("title"))
+    titulo_limpo = titulo_busca(titulo)
+    autor = primeiro_autor(row.get("authors"))
 
-    isbn13 = isbn_limpo(
-        row.get("isbn13")
-    )
-
-    isbn10 = isbn_limpo(
-        row.get("isbn")
-    )
-
-    titulo = (
-        limpar(
-            row.get(
-                "title_without_series"
-            )
-        )
-        or limpar(
-            row.get("title")
-        )
-    )
-
-    queries = []
+    # Consultamos a API por múltiplas chaves independentes e juntamos todos os
+    # candidatos antes de escolher um. Isso impede que uma resposta apenas "plausível"
+    # de ISBN/título encerre a busca prematuramente.
+    queries: list[tuple[str, str]] = []
 
     if isbn13:
-
-        queries.append(
-            (
-                f"isbn:{isbn13}",
-                "google_isbn13",
-            )
-        )
-
+        queries.append((f"isbn:{isbn13}", "google_isbn13"))
     if isbn10:
+        queries.append((f"isbn:{isbn10}", "google_isbn10"))
 
-        queries.append(
-            (
-                f"isbn:{isbn10}",
-                "google_isbn10",
-            )
-        )
-
-    titulo_limpo = titulo_busca(
-        titulo
-    )
-
+    if titulo_limpo and autor:
+        queries.append((f'intitle:"{titulo_limpo}" inauthor:"{autor}"', "google_title_author"))
     if titulo_limpo:
+        queries.append((f'intitle:"{titulo_limpo}"', "google_title"))
 
-        queries.append(
-            (
-                f'intitle:"{titulo_limpo}"',
-                "google_title",
-            )
-        )
+    # Último recurso para títulos com ruído, traduções ou pontuação diferente.
+    if titulo_limpo:
+        queries.append((titulo_limpo, "google_generic"))
+
+    if not queries:
+        return None
+
+    candidatos: dict[str, dict[str, Any]] = {}
+    consultas_realizadas: list[str] = []
+    total_itens = 0
 
     for query, metodo in queries:
-
-        params = {
-            "q":
-                query,
-
-            "maxResults":
-                GOOGLE_MAX_RESULTS,
-
-            "printType":
-                "books",
+        params: dict[str, Any] = {
+            "q": query,
+            "maxResults": GOOGLE_MAX_RESULTS,
+            "printType": "books",
+            "projection": "full",
+            "orderBy": "relevance",
         }
 
         if GOOGLE_API_KEY:
-
-            params["key"] = (
-                GOOGLE_API_KEY
-            )
+            params["key"] = GOOGLE_API_KEY
 
         resposta = get_com_retry(
             session,
@@ -2086,325 +2177,147 @@ def buscar_google(
             fonte="Google Books",
         )
 
+        consultas_realizadas.append(query)
+
         if resposta is None:
             continue
 
         if resposta.status_code == 429:
-
             return {
-                "status":
-                    "rate_limited",
-
-                "source":
-                    "google_books",
+                "status": "rate_limited",
+                "source": "google_books",
             }
 
         if resposta.status_code != 200:
             continue
 
         try:
-
             dados = resposta.json()
-
         except ValueError:
-
             continue
 
-        itens = dados.get(
-            "items",
-            [],
-        )
-
-        if not itens:
+        itens = dados.get("items", [])
+        if not isinstance(itens, list):
             continue
 
-        melhor = None
-
-        melhor_score = -1
-
-        for item in itens:
-
-            if not isinstance(
-                item,
-                dict,
-            ):
+        total_itens += len(itens)
+        for rank, item in enumerate(itens):
+            if not isinstance(item, dict):
+                continue
+            volume_id = limpar(item.get("id"))
+            if not volume_id:
                 continue
 
-            info = item.get(
-                "volumeInfo",
-                {},
-            )
+            # Dedupe por volume_id, preservando uma cópia do melhor contexto de busca.
+            score, sinais = score_google_volume(row, item, metodo, rank)
+            anterior = candidatos.get(volume_id)
+            if anterior is None or score > anterior["score"]:
+                candidatos[volume_id] = {
+                    "item": item,
+                    "score": score,
+                    "sinais": sinais,
+                    "metodo": metodo,
+                }
 
-            sim_titulo = similaridade(
-                titulo,
-                info.get(
-                    "title",
-                    "",
-                ),
-            )
-
-            score = sim_titulo
-
-            if metodo.startswith(
-                "google_isbn"
-            ):
-
-                score += 2
-
-            if score > melhor_score:
-
-                melhor_score = score
-
-                melhor = item
-
-        if melhor is None:
-            continue
-
-        info = melhor.get(
-            "volumeInfo",
-            {},
-        )
-
-        sale = melhor.get(
-            "saleInfo",
-            {},
-        )
-
-        access = melhor.get(
-            "accessInfo",
-            {},
-        )
-
-        autores = juntar_lista(
-            info.get(
-                "authors",
-                [],
-            )
-        )
-
-        categorias = juntar_lista(
-            info.get(
-                "categories",
-                [],
-            )
-        )
-
-        isbn_10 = ""
-
-        isbn_13 = ""
-
-        identificadores = info.get(
-            "industryIdentifiers",
-            [],
-        )
-
-        if isinstance(
-            identificadores,
-            list,
-        ):
-
-            for identifier in (
-                identificadores
-            ):
-
-                if not isinstance(
-                    identifier,
-                    dict,
-                ):
-                    continue
-
-                tipo = limpar(
-                    identifier.get(
-                        "type",
-                        "",
-                    )
-                )
-
-                valor = isbn_limpo(
-                    identifier.get(
-                        "identifier",
-                        "",
-                    )
-                )
-
-                if tipo == "ISBN_10":
-                    isbn_10 = valor
-
-                elif tipo == "ISBN_13":
-                    isbn_13 = valor
-
-        imagens = info.get(
-            "imageLinks",
-            {},
-        )
-
-        if not isinstance(
-            imagens,
-            dict,
-        ):
-            imagens = {}
-
+    if not candidatos:
+        # Não cacheamos falha transitória/rede: None significa que poderá ser tentado
+        # novamente em uma execução futura.
         return {
-            "status":
-                "matched",
-
-            "source":
-                "google_books",
-
-            "google_volume_id":
-                limpar(
-                    melhor.get("id")
-                ),
-
-            "google_title":
-                limpar(
-                    info.get("title")
-                ),
-
-            "google_subtitle":
-                limpar(
-                    info.get("subtitle")
-                ),
-
-            "google_authors":
-                autores,
-
-            "google_publisher":
-                limpar(
-                    info.get("publisher")
-                ),
-
-            "google_published_date":
-                limpar(
-                    info.get(
-                        "publishedDate"
-                    )
-                ),
-
-            "google_description":
-                limpar(
-                    info.get(
-                        "description"
-                    )
-                ),
-
-            "google_page_count":
-                info.get(
-                    "pageCount"
-                ),
-
-            "google_categories":
-                categorias,
-
-            "google_average_rating":
-                info.get(
-                    "averageRating"
-                ),
-
-            "google_ratings_count":
-                info.get(
-                    "ratingsCount"
-                ),
-
-            "google_language":
-                limpar(
-                    info.get(
-                        "language"
-                    )
-                ),
-
-            "google_isbn10":
-                isbn_10,
-
-            "google_isbn13":
-                isbn_13,
-
-            "google_maturity_rating":
-                limpar(
-                    info.get(
-                        "maturityRating"
-                    )
-                ),
-
-            "google_print_type":
-                limpar(
-                    info.get(
-                        "printType"
-                    )
-                ),
-
-            "google_thumbnail":
-                limpar(
-                    imagens.get(
-                        "thumbnail"
-                    )
-                ),
-
-            "google_small_thumbnail":
-                limpar(
-                    imagens.get(
-                        "smallThumbnail"
-                    )
-                ),
-
-            "google_preview_link":
-                limpar(
-                    info.get(
-                        "previewLink"
-                    )
-                ),
-
-            "google_info_link":
-                limpar(
-                    info.get(
-                        "infoLink"
-                    )
-                ),
-
-            "google_web_reader_link":
-                limpar(
-                    access.get(
-                        "webReaderLink"
-                    )
-                ),
-
-            "google_viewability":
-                limpar(
-                    access.get(
-                        "viewability"
-                    )
-                ),
-
-            "google_public_domain":
-                bool(
-                    access.get(
-                        "publicDomain",
-                        False,
-                    )
-                ),
-
-            "google_ebook_available":
-                bool(
-                    "epub" in access
-                    or "pdf" in access
-                ),
-
-            "google_saleability":
-                limpar(
-                    sale.get(
-                        "saleability"
-                    )
-                ),
-
-            "google_search_method":
-                metodo,
-
-            "goodreads_book_id":
-                book_id,
+            "status": "no_match",
+            "source": "google_books",
+            "google_search_method": ";".join(consultas_realizadas),
+            "google_candidate_count": total_itens,
+            "goodreads_book_id": book_id,
         }
 
-    return None
+    melhor = max(candidatos.values(), key=lambda x: x["score"])
+    item = melhor["item"]
+    score = float(melhor["score"])
+    sinais = melhor["sinais"]
+    info = item.get("volumeInfo", {})
+    if not isinstance(info, dict):
+        return None
 
+    # Para título/autor sem ISBN exato, exigimos evidência forte de identidade.
+    # ISBN exato passa independentemente do score textual.
+    aceitacao_forte = bool(sinais.get("isbn_exact")) or (
+        sinais.get("title_similarity", 0.0) >= 0.90
+        and sinais.get("author_similarity", 0.0) >= 0.70
+        and score >= 70.0
+        and not sinais.get("isbn_conflict", False)
+    )
+
+    if not aceitacao_forte:
+        return {
+            "status": "no_match",
+            "source": "google_books",
+            "google_search_method": ";".join(consultas_realizadas),
+            "google_candidate_count": total_itens,
+            "google_best_score": round(score, 2),
+            "google_title_similarity": sinais.get("title_similarity"),
+            "google_author_similarity": sinais.get("author_similarity"),
+            "google_publisher_similarity": sinais.get("publisher_similarity"),
+            "google_year_difference": sinais.get("year_difference"),
+            "google_isbn_exact": sinais.get("isbn_exact", False),
+            "google_isbn_conflict": sinais.get("isbn_conflict", False),
+            "goodreads_book_id": book_id,
+        }
+
+    sale = item.get("saleInfo", {})
+    access = item.get("accessInfo", {})
+    if not isinstance(sale, dict):
+        sale = {}
+    if not isinstance(access, dict):
+        access = {}
+
+    autores = juntar_lista(info.get("authors", []))
+    categorias = juntar_lista(info.get("categories", []))
+    isbn_10, isbn_13 = isbns_google(info)
+
+    imagens = info.get("imageLinks", {})
+    if not isinstance(imagens, dict):
+        imagens = {}
+
+    return {
+        "status": "matched",
+        "source": "google_books",
+        "google_volume_id": limpar(item.get("id")),
+        "google_title": limpar(info.get("title")),
+        "google_subtitle": limpar(info.get("subtitle")),
+        "google_authors": autores,
+        "google_publisher": limpar(info.get("publisher")),
+        "google_published_date": limpar(info.get("publishedDate")),
+        "google_description": limpar(info.get("description")),
+        "google_page_count": info.get("pageCount"),
+        "google_categories": categorias,
+        "google_average_rating": info.get("averageRating"),
+        "google_ratings_count": info.get("ratingsCount"),
+        "google_language": limpar(info.get("language")),
+        "google_isbn10": isbn_10,
+        "google_isbn13": isbn_13,
+        "google_maturity_rating": limpar(info.get("maturityRating")),
+        "google_print_type": limpar(info.get("printType")),
+        "google_thumbnail": limpar(imagens.get("thumbnail")),
+        "google_small_thumbnail": limpar(imagens.get("smallThumbnail")),
+        "google_preview_link": limpar(info.get("previewLink")),
+        "google_info_link": limpar(info.get("infoLink")),
+        "google_web_reader_link": limpar(access.get("webReaderLink")),
+        "google_viewability": limpar(access.get("viewability")),
+        "google_public_domain": bool(access.get("publicDomain", False)),
+        "google_ebook_available": bool("epub" in access or "pdf" in access),
+        "google_saleability": limpar(sale.get("saleability")),
+        "google_search_method": sinais.get("query_method", ""),
+        "google_queries_used": ";".join(consultas_realizadas),
+        "google_candidate_count": total_itens,
+        "google_best_score": round(score, 2),
+        "google_title_similarity": sinais.get("title_similarity"),
+        "google_author_similarity": sinais.get("author_similarity"),
+        "google_publisher_similarity": sinais.get("publisher_similarity"),
+        "google_year_difference": sinais.get("year_difference"),
+        "google_isbn_exact": sinais.get("isbn_exact", False),
+        "google_isbn_conflict": sinais.get("isbn_conflict", False),
+        "goodreads_book_id": book_id,
+    }
 
 def consultar_google(
     df_books: pd.DataFrame,
@@ -3105,6 +3018,15 @@ def main() -> None:
         f"{len(cache_google):,}"
     )
 
+    print(
+        "Google Books API key: "
+        + ("configurada" if GOOGLE_API_KEY else "não configurada (modo público)")
+    )
+    print(
+        "Google Books: consultas ISBN + título/autor + título, "
+        f"até {GOOGLE_MAX_RESULTS} candidatos por consulta."
+    )
+
     # --------------------------------------------------------
     # Execução
     # --------------------------------------------------------
@@ -3241,4 +3163,5 @@ if __name__ == "__main__":
         )
 
         sys.exit(1)
+
 
