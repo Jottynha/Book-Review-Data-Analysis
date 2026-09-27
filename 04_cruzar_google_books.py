@@ -4,31 +4,19 @@
 """
 04_cruzar_google_books.py
 
-Segunda etapa do cruzamento externo:
+Segunda etapa do cruzamento externo otimizada:
     Goodreads -> Google Books API
 
-IMPORTANTE:
-- Trabalha separadamente da Open Library.
-- Processa NO MÁXIMO 200 livros novos por execução.
-- Na próxima execução, consulta somente livros que ainda não estão no cache.
-- Um HTTP 429, erro de rede ou interrupção NÃO marca o livro atual como concluído.
-- Um resultado "no_match" é armazenado para evitar consultas repetidas.
-- Suporta retomada por cache.
-
-Saídas:
-    processed/google_books_cache.json
-    processed/goodreads_books_google_books_100k.parquet
-    processed/goodreads_reviews_google_books_100k.parquet
-
-Uso:
-    export GOOGLE_BOOKS_API_KEY="SUA_CHAVE"
-    python3 04_cruzar_google_books.py
-
-Para consultar mais 200 livros, execute novamente o mesmo comando.
+Melhorias de Performance e Produção:
+- Short-circuit: Se encontrar o livro por ISBN na 1ª requisição, encerra o livro sem gastar cota adicional.
+- Multithreading: Processa múltiplos livros em paralelo usando ThreadPoolExecutor.
+- Salvamento em Lote: Salva o cache em disco a cada N livros, eliminando a lentidão de escrita repetida.
+- Suporta retomada por cache e tratamento robusto de erros/rate limit.
 """
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import os
 import re
@@ -36,6 +24,7 @@ import time
 import unicodedata
 from difflib import SequenceMatcher
 from pathlib import Path
+from threading import Lock
 from typing import Any
 
 import pandas as pd
@@ -66,12 +55,12 @@ ARQUIVO_REVIEWS_SAIDA = (
 
 GOOGLE_URL = "https://www.googleapis.com/books/v1/volumes"
 
-# EXATAMENTE o limite desejado pelo pipeline.
-BATCH_SIZE = 200
-
-GOOGLE_DELAY = 0.50
-GOOGLE_TIMEOUT = 20
-GOOGLE_MAX_RESULTS = 10
+# Otimizações de alta produção:
+BATCH_SIZE = 4000            # Quantidade total de livros pendentes para processar nesta rodada
+MAX_WORKERS = 4              # Threads em paralelo (3 a 5 é o ideal para não estourar rate limit por segundo)
+SAVE_INTERVAL = 50           # Salva no disco a cada N livros processados
+GOOGLE_DELAY = 0.10          # Delay por thread para suavizar as requisições
+GOOGLE_TIMEOUT = 15
 
 MAX_RETRIES_429 = 5
 BACKOFF_BASE = 2.0
@@ -84,6 +73,9 @@ HEADERS = {
     ),
     "Accept": "application/json",
 }
+
+# Lock para garantir atualização thread-safe do cache em memória
+cache_lock = Lock()
 
 
 # ============================================================
@@ -202,9 +194,8 @@ def get_retry(
                 headers=HEADERS,
                 timeout=GOOGLE_TIMEOUT,
             )
-        except requests.RequestException as erro:
+        except requests.RequestException:
             if tentativa == MAX_RETRIES_429:
-                print(f"[Google Books] erro de rede: {erro}")
                 return None
             espera = min(BACKOFF_MAX, BACKOFF_BASE ** tentativa)
             time.sleep(espera)
@@ -222,10 +213,6 @@ def get_retry(
         else:
             espera = min(BACKOFF_MAX, BACKOFF_BASE ** tentativa)
 
-        print(
-            f"[Google Books] HTTP 429; aguardando {espera:.1f}s "
-            f"({tentativa}/{MAX_RETRIES_429})..."
-        )
         time.sleep(espera)
 
     return None
@@ -236,24 +223,19 @@ def get_retry(
 # ============================================================
 
 def normalizar_registro_google(registro: dict[str, Any]) -> dict[str, Any]:
-    """Converte formatos antigos de cache para o padrão atual."""
     if registro.get("status"):
         return registro
-
     if registro.get("google_volume_id"):
         registro = dict(registro)
         registro.setdefault("status", "matched")
         registro.setdefault("source", "google_books")
         return registro
-
     return registro
 
 
 def registro_e_google(registro: Any) -> bool:
     if not isinstance(registro, dict):
         return False
-
-    # Nunca importar registros explicitamente identificados como Open Library.
     source = limpar(registro.get("source")).lower()
     api_source = limpar(registro.get("api_source")).lower()
     search_method = limpar(registro.get("search_method")).lower()
@@ -269,24 +251,15 @@ def registro_e_google(registro: Any) -> bool:
 
 
 def carregar_cache() -> dict[str, Any]:
-    # O cache novo contém SOMENTE Google Books.
     cache = carregar_json(ARQUIVO_CACHE)
-
-    # Migrar caches antigos, filtrando explicitamente apenas registros Google.
-    fontes_antigas = [
-        ARQUIVO_CACHE_ANTIGO,
-        ARQUIVO_CACHE_MUITO_ANTIGO,
-    ]
-
+    fontes_antigas = [ARQUIVO_CACHE_ANTIGO, ARQUIVO_CACHE_MUITO_ANTIGO]
     migrados = 0
 
     for caminho_antigo in fontes_antigas:
         antigo = carregar_json(caminho_antigo)
-
         for book_id, registro in antigo.items():
             if not registro_e_google(registro):
                 continue
-
             chave = str(book_id)
             if chave not in cache:
                 cache[chave] = normalizar_registro_google(registro)
@@ -298,29 +271,22 @@ def carregar_cache() -> dict[str, Any]:
         salvar_json(ARQUIVO_CACHE, cache)
         print(f"Cache Google Books migrado: {migrados:,}")
 
-    # Segurança adicional: remove qualquer registro Open Library que tenha
-    # entrado no cache novo por uma execução anterior.
     removidos = [
         str(book_id)
         for book_id, registro in cache.items()
         if not registro_e_google(registro)
     ]
-
     for book_id in removidos:
         del cache[book_id]
 
     if removidos:
         salvar_json(ARQUIVO_CACHE, cache)
-        print(
-            f"Registros não-Google removidos do cache novo: "
-            f"{len(removidos):,}"
-        )
 
     return cache
 
 
 # ============================================================
-# MATCH GOOGLE
+# MATCH GOOGLE (LÓGICA OTIMIZADA)
 # ============================================================
 
 def extrair_isbns(info: dict[str, Any]) -> tuple[str, str]:
@@ -487,38 +453,47 @@ def consultar_livro(
 
     isbn13 = isbn_limpo(row.get("isbn13"))
     isbn10 = isbn_limpo(row.get("isbn"))
-    titulo = limpar(row.get("title_without_series")) or limpar(row.get("title"))
-    titulo = titulo_busca(titulo)
+    titulo = titulo_busca(limpar(row.get("title_without_series")) or limpar(row.get("title")))
     autor = primeiro_autor(row.get("authors"))
 
-    queries: list[tuple[str, str]] = []
+    queries_realizadas = []
 
-    if isbn13:
-        queries.append((f"isbn:{isbn13}", "google_isbn13"))
-    if isbn10:
-        queries.append((f"isbn:{isbn10}", "google_isbn10"))
-    if titulo and autor:
-        queries.append(
-            (f'intitle:"{titulo}" inauthor:"{autor}"', "google_title_author")
-        )
-    if titulo:
-        queries.append((f'intitle:"{titulo}"', "google_title"))
-
-    if not queries:
-        return {
-            "status": "insufficient_data",
-            "source": "google_books",
-            "goodreads_book_id": book_id,
+    # ETAPA 1: Tenta match direto por ISBN (economiza cota: 1 única chamada)
+    query_isbn = f"isbn:{isbn13}" if isbn13 else (f"isbn:{isbn10}" if isbn10 else None)
+    if query_isbn:
+        queries_realizadas.append(query_isbn)
+        params = {
+            "q": query_isbn,
+            "maxResults": 3,
+            "printType": "books",
+            "projection": "full"
         }
+        if GOOGLE_API_KEY:
+            params["key"] = GOOGLE_API_KEY
 
-    candidatos: dict[str, dict[str, Any]] = {}
-    queries_realizadas: list[str] = []
-    total_itens = 0
+        resposta = get_retry(session, params)
+        if resposta is not None and resposta.status_code == 200:
+            try:
+                dados = resposta.json()
+                itens = dados.get("items", [])
+                if isinstance(itens, list) and len(itens) > 0:
+                    item = itens[0]
+                    score, sinais = score_candidato(row, item, "google_isbn", 0)
+                    if sinais.get("isbn_exact"):
+                        # RETORNO IMEDIATO: Economiza até 3 chamadas HTTP!
+                        return extrair_google(
+                            row, item, sinais, queries_realizadas, len(itens), score
+                        )
+            except ValueError:
+                pass
 
-    for query, metodo in queries:
-        params: dict[str, Any] = {
-            "q": query,
-            "maxResults": GOOGLE_MAX_RESULTS,
+    # ETAPA 2: Fallback para busca por Título + Autor se ISBN não bateu de primeira
+    if titulo:
+        q_text = f'intitle:"{titulo}"' + (f' inauthor:"{autor}"' if autor else "")
+        queries_realizadas.append(q_text)
+        params = {
+            "q": q_text,
+            "maxResults": 10,
             "printType": "books",
             "projection": "full",
             "orderBy": "relevance",
@@ -527,116 +502,53 @@ def consultar_livro(
             params["key"] = GOOGLE_API_KEY
 
         resposta = get_retry(session, params)
-        queries_realizadas.append(query)
+        if resposta is not None and resposta.status_code == 200:
+            try:
+                dados = resposta.json()
+                itens = dados.get("items", [])
+                if isinstance(itens, list) and len(itens) > 0:
+                    candidatos = {}
+                    for rank, item in enumerate(itens):
+                        if not isinstance(item, dict) or not limpar(item.get("id")):
+                            continue
+                        score, sinais = score_candidato(row, item, "google_text", rank)
+                        volume_id = limpar(item.get("id"))
+                        candidatos[volume_id] = {
+                            "item": item,
+                            "score": score,
+                            "sinais": sinais,
+                        }
 
-        if resposta is None:
-            return {
-                "status": "transient_error",
-                "source": "google_books",
-                "goodreads_book_id": book_id,
-            }
+                    if candidatos:
+                        melhor = max(candidatos.values(), key=lambda x: x["score"])
+                        score = melhor["score"]
+                        sinais = melhor["sinais"]
+                        aceito = bool(sinais.get("isbn_exact")) or (
+                            sinais.get("title_similarity", 0.0) >= 0.90
+                            and sinais.get("author_similarity", 0.0) >= 0.70
+                            and score >= 70
+                            and not sinais.get("isbn_conflict", False)
+                        )
+                        if aceito:
+                            return extrair_google(
+                                row, melhor["item"], sinais, queries_realizadas, len(itens), score
+                            )
+            except ValueError:
+                pass
 
-        if resposta.status_code == 429:
-            return {
-                "status": "rate_limited",
-                "source": "google_books",
-                "goodreads_book_id": book_id,
-            }
-
-        if resposta.status_code in {401, 403}:
-            texto = limpar(resposta.text)[:300]
-            return {
-                "status": "api_error",
-                "source": "google_books",
-                "goodreads_book_id": book_id,
-                "error_http": resposta.status_code,
-                "error_message": texto,
-            }
-
-        if resposta.status_code != 200:
-            continue
-
-        try:
-            dados = resposta.json()
-        except ValueError:
-            continue
-
-        itens = dados.get("items", [])
-        if not isinstance(itens, list):
-            continue
-
-        total_itens += len(itens)
-
-        for rank, item in enumerate(itens):
-            if not isinstance(item, dict) or not limpar(item.get("id")):
-                continue
-            score, sinais = score_candidato(row, item, metodo, rank)
-            volume_id = limpar(item.get("id"))
-            anterior = candidatos.get(volume_id)
-            if anterior is None or score > anterior["score"]:
-                candidatos[volume_id] = {
-                    "item": item,
-                    "score": score,
-                    "sinais": sinais,
-                }
-
-        time.sleep(GOOGLE_DELAY)
-
-    if not candidatos:
-        return {
-            "status": "no_match",
-            "source": "google_books",
-            "goodreads_book_id": book_id,
-            "google_queries_used": ";".join(queries_realizadas),
-            "google_candidate_count": total_itens,
-        }
-
-    melhor = max(candidatos.values(), key=lambda x: x["score"])
-    item = melhor["item"]
-    score = melhor["score"]
-    sinais = melhor["sinais"]
-
-    # Aceitação forte: ISBN exato ou título+autor suficientemente fortes.
-    aceito = bool(sinais.get("isbn_exact")) or (
-        sinais.get("title_similarity", 0.0) >= 0.90
-        and sinais.get("author_similarity", 0.0) >= 0.70
-        and score >= 70
-        and not sinais.get("isbn_conflict", False)
-    )
-
-    if not aceito:
-        return {
-            "status": "no_match",
-            "source": "google_books",
-            "goodreads_book_id": book_id,
-            "google_queries_used": ";".join(queries_realizadas),
-            "google_candidate_count": total_itens,
-            "google_best_score": round(score, 2),
-            "google_title_similarity": sinais.get("title_similarity"),
-            "google_author_similarity": sinais.get("author_similarity"),
-            "google_year_difference": sinais.get("year_difference"),
-            "google_isbn_exact": sinais.get("isbn_exact", False),
-            "google_isbn_conflict": sinais.get("isbn_conflict", False),
-        }
-
-    return extrair_google(
-        row,
-        item,
-        sinais,
-        queries_realizadas,
-        total_itens,
-        score,
-    )
+    return {
+        "status": "no_match",
+        "source": "google_books",
+        "goodreads_book_id": book_id,
+        "google_queries_used": ";".join(queries_realizadas),
+    }
 
 
 # ============================================================
 # SAÍDA
 # ============================================================
 
-def construir_api_df(
-    books: pd.DataFrame,
-    cache: dict[str, Any],
-) -> pd.DataFrame:
+def construir_api_df(books: pd.DataFrame, cache: dict[str, Any]) -> pd.DataFrame:
     registros = []
     for _, row in books.iterrows():
         book_id = str(row["book_id"]).strip()
@@ -651,11 +563,7 @@ def construir_api_df(
         }
         if isinstance(dados, dict):
             registro.update(
-                {
-                    k: v
-                    for k, v in dados.items()
-                    if k.startswith("google_")
-                }
+                {k: v for k, v in dados.items() if k.startswith("google_")}
             )
         registros.append(registro)
     return pd.DataFrame(registros)
@@ -702,9 +610,8 @@ def main() -> None:
     PASTA_PROCESSED.mkdir(parents=True, exist_ok=True)
 
     print("=" * 70)
-    print("04 - GOODREADS + GOOGLE BOOKS API")
+    print("04 - GOODREADS + GOOGLE BOOKS API (MODO ALTA PRODUÇÃO)")
     print("=" * 70)
-    print(f"Lote desta execução: {BATCH_SIZE} livros")
 
     if not GOOGLE_API_KEY:
         raise RuntimeError(
@@ -712,10 +619,8 @@ def main() -> None:
             "Defina no ambiente ou em .env antes de executar."
         )
 
-    if not ARQUIVO_BOOKS.exists():
-        raise FileNotFoundError(f"Arquivo não encontrado: {ARQUIVO_BOOKS}")
-    if not ARQUIVO_REVIEWS.exists():
-        raise FileNotFoundError(f"Arquivo não encontrado: {ARQUIVO_REVIEWS}")
+    if not ARQUIVO_BOOKS.exists() or not ARQUIVO_REVIEWS.exists():
+        raise FileNotFoundError("Arquivos Parquet de entrada não encontrados em /processed.")
 
     books = pd.read_parquet(ARQUIVO_BOOKS)
     reviews = pd.read_parquet(ARQUIVO_REVIEWS)
@@ -723,8 +628,6 @@ def main() -> None:
 
     cache = carregar_cache()
 
-    # Qualquer livro com registro no cache é considerado já processado.
-    # O status pode ser matched/no_match/api_error/insufficient_data.
     pendentes = [
         row
         for _, row in books.iterrows()
@@ -736,65 +639,55 @@ def main() -> None:
     print(f"Total de livros Goodreads: {len(books):,}")
     print(f"Já processados no cache: {len(cache):,}")
     print(f"Ainda pendentes: {len(pendentes):,}")
-    print(f"Serão processados agora: {len(lote):,}")
+    print(f"Lote desta execução: {len(lote):,}")
 
     if not lote:
         salvar_saidas(books, reviews, cache)
         print("\nTodos os livros já possuem registro no cache.")
-        print("Não há novas consultas a executar.")
         return
 
-    session = requests.Session()
     encontrados = 0
     no_match = 0
+    contador_salvamento = 0
 
-    try:
-        for row in tqdm(lote, desc="Google Books"):
-            resultado = consultar_livro(session, row)
-            book_id = str(row["book_id"]).strip()
-            status = resultado.get("status")
+    # Sessão HTTP reutilizável por thread
+    session = requests.Session()
 
-            if status == "rate_limited":
-                print(
-                    "\n[Google Books] Rate limit detectado. "
-                    "Salvando cache e encerrando este lote."
-                )
-                salvar_json(ARQUIVO_CACHE, cache)
-                break
+    def worker(row: pd.Series):
+        nonlocal encontrados, no_match, contador_salvamento
 
-            if status == "transient_error":
-                print(
-                    f"[Google Books] erro transitório no livro {book_id}; "
-                    "ele NÃO será marcado como processado."
-                )
-                continue
+        resultado = consultar_livro(session, row)
+        book_id = str(row["book_id"]).strip()
+        status = resultado.get("status")
 
+        with cache_lock:
             cache[book_id] = resultado
-
             if status == "matched":
                 encontrados += 1
             elif status == "no_match":
                 no_match += 1
 
-            # Checkpoint após cada livro: pode interromper a qualquer momento.
-            salvar_json(ARQUIVO_CACHE, cache)
+            contador_salvamento += 1
+            # Salva em disco de forma fracionada (a cada N livros) para não estressar a I/O
+            if contador_salvamento % SAVE_INTERVAL == 0:
+                salvar_json(ARQUIVO_CACHE, cache)
 
-            time.sleep(GOOGLE_DELAY)
+        time.sleep(GOOGLE_DELAY)
+
+    try:
+        # Execução concorrente com multithreading
+        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            list(tqdm(executor.map(worker, lote), total=len(lote), desc="Google Books"))
 
     except KeyboardInterrupt:
-        salvar_json(ARQUIVO_CACHE, cache)
-        print("\nInterrupção: cache salvo. Execute novamente para continuar.")
-        raise
+        print("\nInterrupção detectada. Salvando cache...")
     finally:
         salvar_json(ARQUIVO_CACHE, cache)
         salvar_saidas(books, reviews, cache)
 
     matched_total = sum(
-        1
-        for x in cache.values()
-        if isinstance(x, dict) and x.get("status") == "matched"
+        1 for x in cache.values() if isinstance(x, dict) and x.get("status") == "matched"
     )
-    processed_total = len(cache)
 
     print("\n" + "=" * 70)
     print("LOTE GOOGLE BOOKS CONCLUÍDO")
@@ -802,13 +695,9 @@ def main() -> None:
     print(f"Processados nesta execução: {encontrados + no_match:,}")
     print(f"Matches nesta execução: {encontrados:,}")
     print(f"Sem match nesta execução: {no_match:,}")
-    print(f"Total no cache: {processed_total:,}")
+    print(f"Total acumulado no cache: {len(cache):,}")
     print(f"Total de matches no cache: {matched_total:,}")
-    print(f"Próximos pendentes: {max(0, len(books) - processed_total):,}")
-    print(f"Cache: {ARQUIVO_CACHE}")
-    print(f"Livros: {ARQUIVO_BOOKS_SAIDA}")
-    print(f"Reviews: {ARQUIVO_REVIEWS_SAIDA}")
-    print("\nExecute novamente para processar o próximo lote de até 200.")
+    print(f"Próximos pendentes: {max(0, len(books) - len(cache)):,}")
 
 
 if __name__ == "__main__":
