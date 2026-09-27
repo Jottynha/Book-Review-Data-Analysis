@@ -43,8 +43,6 @@ ARQUIVO_BOOKS = PASTA_PROCESSED / "goodreads_books_100k.parquet"
 ARQUIVO_REVIEWS = PASTA_PROCESSED / "goodreads_reviews_100k.parquet"
 
 ARQUIVO_CACHE = PASTA_PROCESSED / "google_books_cache_batches.json"
-ARQUIVO_CACHE_ANTIGO = PASTA_PROCESSED / "google_books_cache_v3.json"
-ARQUIVO_CACHE_MUITO_ANTIGO = PASTA_PROCESSED / "google_books_cache.json"
 
 ARQUIVO_BOOKS_SAIDA = (
     PASTA_PROCESSED / "goodreads_books_google_books_100k.parquet"
@@ -252,24 +250,6 @@ def registro_e_google(registro: Any) -> bool:
 
 def carregar_cache() -> dict[str, Any]:
     cache = carregar_json(ARQUIVO_CACHE)
-    fontes_antigas = [ARQUIVO_CACHE_ANTIGO, ARQUIVO_CACHE_MUITO_ANTIGO]
-    migrados = 0
-
-    for caminho_antigo in fontes_antigas:
-        antigo = carregar_json(caminho_antigo)
-        for book_id, registro in antigo.items():
-            if not registro_e_google(registro):
-                continue
-            chave = str(book_id)
-            if chave not in cache:
-                cache[chave] = normalizar_registro_google(registro)
-                cache[chave].setdefault("source", "google_books")
-                cache[chave].setdefault("status", "matched")
-                migrados += 1
-
-    if migrados:
-        salvar_json(ARQUIVO_CACHE, cache)
-        print(f"Cache Google Books migrado: {migrados:,}")
 
     removidos = [
         str(book_id)

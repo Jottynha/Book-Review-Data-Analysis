@@ -1,146 +1,90 @@
-# 📚 Book-Review-Data-Analysis (Branch: `openlibrary`)
+# Book Review Data Analysis
 
-Repositório para o trabalho prático da disciplina de **Ciência de Dados (CEFET-MG)**.  
-O objetivo deste projeto é analisar padrões de avaliações, resenhas textuais, engajamento e métricas editoriais a partir de uma amostra de **10.000 resenhas do Goodreads**, enriquecida com metadados externos da **Open Library** e **Google Books**.
+Projeto de Ciência de Dados (CEFET-MG) para analisar o comportamento de leitores a partir de 10.000 resenhas do Goodreads, enriquecidas com metadados da Open Library e do Google Books.
 
----
+## Estado atual
 
-## 📊 Status de Cobertura de Metadados
+| Indicador | Resultado |
+| --- | ---: |
+| Reviews Goodreads | 10.000 |
+| Livros únicos | 8.916 |
+| Livros com match Open Library | 7.654 (85,85%) |
+| Livros com match Google Books | 4.424 (49,62%) |
+| Livros com confiança `MUITO_ALTO`, `ALTO` ou `MEDIO` | 7.031 (78,86%) |
+| Reviews com confiança adequada | 8.033 |
+| Reviews com ambas as APIs e confiança adequada | 4.293 |
 
-Para superar o gargalo de IDs numéricos e dados faltantes da base bruta, implementamos um pipeline híbrido de enriquecimento de dados via **Open Library Books API** e **Search API com validação cruzada**:
+Os números de reviews são maiores que os de livros porque um mesmo livro pode ter várias resenhas.
 
-![Status de Cobertura de Metadados](assets/cobertura_metadados.png)
+### Bases recomendadas
 
-### 📈 Resumo das Métricas de Cobertura
+- Análise comportamental geral: `processed/goodreads_reviews_validated_100k.parquet`, filtrando `match_status` em `MUITO_ALTO`, `ALTO` e `MEDIO`.
+- Comparação entre as APIs: além do filtro de confiança, exigir `openlibrary_match == True` e `google_match == True`.
+- Auditoria: `processed/matches_para_revisao.csv` e `processed/relatorio_qualidade_matches.txt`.
 
-| Nível de Análise | Total de Registros | Cobertura com Metadados Externos | Taxa de Sucesso |
-| :--- | :--- | :--- | :--- |
-| **Livros Únicos** | `8.916` títulos | **`8.145` livros** enriquecidos | **91,35%** |
-| **Avaliações (Reviews)** | `10.000` resenhas | **`10.000` resenhas** integradas | **100,00%** |
-| **Reviews com Metadados Externos** | `10.000` resenhas | **`9.216` resenhas** com dados externos | **92,16%** |
-| **Reviews com ISBN-13** | `10.000` resenhas | **`9.974` resenhas** com ISBN-13 | **99,74%** |
+```python
+import pandas as pd
 
-> **Nota Metodológica:** Como os livros mais populares concentram um volume muito maior de avaliações, a taxa de enriquecimento no dataset de reviews atinge **92,16%**, com autores identificados para **mais de 99,6%** de todas as resenhas.
-
----
-
-## 🔍 Cobertura com APIs Externas (Open Library + Google Books)
-
-Abaixo está o raio-x de preenchimento dos metadados externos capturados diretamente pelas APIs (Open Library e Google Books) para a base de 10.000 avaliações:
-
-| Atributo | Cobertura (Reviews) | Cobertura (Livros) | Fonte da API | Status / Impacto na Análise |
-| :--- | :---: | :---: | :--- | :--- |
-| **ISBN-13 Padronizado** | **`9.974` (99,74%)** | `6.631` (74,37%) | Goodreads + OL Search | ✅ **Resolvido** (1.234 ISBNs resgatados por busca de título) |
-| **Metadados Externos (APIs)**| **`9.216` (92,16%)** | `8.145` (91,35%) | Open Library + Google Books | 🌟 **Taxa Global de Sucesso das APIs** |
-| **Título Validado (API)** | **`9.213` (92,13%)** | `8.142` (91,32%) | Open Library + Google Books | ✅ **Padronizado** (títulos oficiais sem ruído) |
-| **Nome do Autor (Extenso)** | **`9.136` (91,36%)** | `8.104` (90,89%) | Open Library + Google Books | ✅ **Resolvido** (substitui o ID numérico opaco do Goodreads) |
-| **Categorias / Gênero (API)** | **`8.082` (80,82%)** | `7.180` (80,53%) | Open Library + Google Books | ✅ **Padronizado** (taxonomia bibliográfica formal) |
-| **Número de Páginas (API)** | **`7.295` (72,95%)** | `6.480` (72,68%) | Open Library + Google Books | ✅ **Disponível** para correlação de tamanho e nota |
-| **Nota Open Library** | **`6.149` (61,49%)** | `5.116` (57,38%) | Open Library Search Ratings | 🌟 **Diferencial** para estudo comparativo de plataformas |
-| **Status Comercial / E-book** | **`795` (7,95%)** | `711` (7,97%) | Google Play Books Store | ✅ **Integrado** (via fallback da Google Books API) |
-
-### ⚠️ O que está Faltando e Por Quê?
-* **Apenas 771 Livros sem Metadados nas APIs (8,65% dos títulos únicos / 7,84% das reviews):**
-  * Correspondem a capítulos avulsos do Kindle, fanzines, quadrinhos serializados (*single issues* como *The Walking Dead #162*), fanfics do AO3 ou edições raras que não possuem registro bibliográfico formal em bibliotecas nem no Google Play Livros.
-  * O Goodreads original preserva suas avaliações, resenhas de texto e notas originais, garantindo que o dataset de avaliações continue com 10.000 resenhas válidas.
-
----
-
-## 🛠️ Arquitetura do Pipeline de Dados
-
-O fluxo de dados foi projetado para ser **multiplataforma (Windows e Linux)**, resiliente a falhas de rede e otimizado com paralelismo assíncrono:
-
-```mermaid
-flowchart TD
-    A["Dataset Bruto Goodreads<br/>(15M Reviews + 2M Books)"] --> B["01_amostra_reviews.py<br/>Reservoir Sampling (10.000 reviews)"]
-    B --> C["02_cruzar_reviews.py<br/>Left Join (Reviews + Books por book_id)"]
-    
-    C --> D["03_cruzar_api.py<br/>Pipeline de Enriquecimento Híbrido"]
-    
-    subgraph Enriquecimento["03_cruzar_api.py (Lógica Multi-Estágio)"]
-        D1["Etapa 1: Open Library Batch<br/>(Lotes de 50 ISBNs - ~6.100 livros)"]
-        D2["Etapa 2: Open Library Search API<br/>(Busca por Título com Validação Anti-Homônimos)"]
-        D3["Etapa 2.1: Resgate de ISBNs<br/>(Recuperação de ISBN-10 e ISBN-13)"]
-        D4["Etapa 2.2: Atualização em Lote<br/>(Metadados profundos da edição via ISBN)"]
-        D5["Etapa 2.3: Coleta de Notas em Lote<br/>(Open Library Ratings para estudo comparativo)"]
-        D6["Etapa 3: Fallback Google Books<br/>(Opcional, com proteção de cota diária)"]
-        
-        D1 --> D2 --> D3 --> D4 --> D5 --> D6
-    end
-    
-    D --> Enriquecimento
-    Enriquecimento --> E[("Cache Persistente<br/>google_books_cache.json")]
-    Enriquecimento --> F["Datasets Finais Parquet<br/>(processed/)"]
+df = pd.read_parquet("processed/goodreads_reviews_validated_100k.parquet")
+df = df[
+    df["openlibrary_match"]
+    & df["google_match"]
+    & df["match_status"].isin(["MUITO_ALTO", "ALTO", "MEDIO"])
+]
 ```
 
----
-
-## 📁 Estrutura de Arquivos
+## Pipeline
 
 ```text
-Book-Review-Data-Analysis/
-├── assets/
-│   └── cobertura_metadados.png                 # Gráfico visual de cobertura de metadados
-├── processed/
-│   ├── goodreads_books_100k.parquet            # Base bruta dos 8.916 livros únicos da amostra
-│   ├── goodreads_reviews_100k.parquet          # Amostra de 10.000 avaliações do Goodreads
-│   ├── goodreads_reviews_with_books_100k.parquet # Join inicial Goodreads (Reviews + Books)
-│   ├── google_books_100k.parquet               # Tabela consolidada dos 8.145 livros enriquecidos
-│   ├── goodreads_reviews_google_books_100k.parquet # DATASET FINAL: 10.000 reviews × 62 colunas
-│   └── google_books_cache.json                 # Cache JSON persistido para reprodutibilidade
-├── 01_amostra_reviews.py                       # Script de amostragem (Reservoir Sampling)
-├── 02_cruzar_reviews.py                        # Script de cruzamento inicial (Reviews + Books)
-├── 03_cruzar_api.py                            # Script mestre de enriquecimento e coleta de notas
-├── requirements.txt                            # Dependências do projeto Python
-└── README.md                                   # Documentação técnica do repositório
+01_amostra_reviews.py
+    -> goodreads_reviews_100k.parquet
+02_cruzar_reviews.py
+    -> associação inicial entre reviews e livros
+03_cruzar_openlibrary.py
+    -> goodreads_books_openlibrary_100k.parquet
+04_cruzar_google_books.py
+    -> goodreads_books_google_books_100k.parquet
+05_validar_matches.py
+    -> goodreads_books_validated_100k.parquet
+    -> goodreads_reviews_validated_100k.parquet
 ```
 
----
+O validador cruza as duas APIs por `book_id`, compara títulos, autores, anos e ISBNs, e prioriza um ISBN compartilhado quando há divergência de título por tradução ou edição. Matches fracos ou conflitantes ficam registrados para revisão manual.
 
-## 🚀 Como Executar o Projeto
+## Arquivos principais
 
-Os scripts foram refatorados para garantir **compatibilidade total tanto no Linux quanto no Windows**, utilizando caminhos dinâmicos (`pathlib.Path`) e suporte automático a UTF-8.
+```text
+processed/
+├── goodreads_books_100k.parquet                 # livros Goodreads da amostra
+├── goodreads_reviews_100k.parquet               # reviews Goodreads da amostra
+├── goodreads_books_openlibrary_100k.parquet     # resultado Open Library
+├── goodreads_books_google_books_100k.parquet    # resultado Google Books
+├── goodreads_books_validated_100k.parquet       # livros com confiança calculada
+├── goodreads_reviews_validated_100k.parquet     # base final para análise
+├── openlibrary_cache.json                        # cache ativo da Open Library
+├── google_books_cache_batches.json              # cache ativo do Google Books
+├── matches_para_revisao.csv                     # matches baixos ou rejeitados
+└── relatorio_qualidade_matches.*                # métricas da validação
+```
 
-### 1. Clonar e Acessar a Branch
+Os caches são mantidos para evitar novas chamadas às APIs. Os arquivos intermediários e o gráfico de cobertura foram removidos por não serem necessários para a análise nem para a execução atual.
+
+## Execução
 
 ```bash
-git clone https://github.com/Jottynha/Book-Review-Data-Analysis.git
-cd Book-Review-Data-Analysis
-git checkout openlibrary
+python3 -m pip install -r requirements.txt
+python3 01_amostra_reviews.py
+python3 02_cruzar_reviews.py
+python3 03_cruzar_openlibrary.py
+python3 04_cruzar_google_books.py
+python3 05_validar_matches.py
 ```
 
-### 2. Instalar Dependências
+Para a etapa do Google Books, configure `GOOGLE_BOOKS_API_KEY` no ambiente ou em `.env`. As etapas externas reaproveitam os caches persistidos em `processed/`.
 
-```bash
-pip install -r requirements.txt
-```
+## Possibilidades de análise
 
-### 3. Executar o Pipeline
-
-Se os arquivos brutos já foram processados na pasta `processed/`, você pode rodar diretamente o enriquecimento ou a consolidação:
-
-```bash
-# Executa o enriquecimento híbrido (aproveita o cache e conclui em segundos)
-python 03_cruzar_api.py
-```
-
-> **Dica (Fallback Opcional do Google Books):** Caso deseje ativar o fallback do Google Books para os livros que restaram, basta definir a variável de ambiente antes da execução:
-> * **Windows (PowerShell):** `$env:GOOGLE_BOOKS_API_KEY="SUA_CHAVE"`
-> * **Linux (Bash):** `export GOOGLE_BOOKS_API_KEY="SUA_CHAVE"`
-
----
-
-## 🔬 Oportunidades de Análise para Ciência de Dados
-
-Com este dataset enriquecido de **62 colunas**, o grupo tem em mãos diversas frentes ricas para responder na disciplina:
-
-1. **Comparação de Avaliação entre Plataformas (Goodreads vs. Open Library):**
-   * Livros mais aclamados pela crítica têm notas consistentes entre diferentes plataformas de leitores?
-2. **Engajamento e Utilidade das Resenhas:**
-   * Resenhas mais longas ou detalhadas recebem mais votos de utilidade (`n_votes`, `n_comments`)?
-3. **Distribuição de Notas por Gênero Literário:**
-   * Quais categorias de livros apresentam maior polarização ou desvio padrão nas notas?
-4. **Impacto do Tamanho do Livro (`num_pages`) na Satisfação:**
-   * Livros muito volumosos (>600 páginas) tendem a receber notas mais altas por viés de leitor comprometido?
-5. **Processamento de Linguagem Natural (NLP):**
-   * Análise de sentimento do texto da resenha (`review_text`) vs. a nota real dada pelo usuário (`rating`).
+- Relação entre a nota (`rating`) e o sentimento do texto da resenha.
+- Efeito de tamanho, gênero e popularidade do livro sobre a nota.
+- Relação entre extensão da resenha, votos de utilidade e comentários.
+- Comparação entre avaliações e metadados disponíveis nas duas plataformas.

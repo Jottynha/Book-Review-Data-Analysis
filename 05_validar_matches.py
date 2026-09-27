@@ -50,14 +50,19 @@ PASTA_PROJETO = Path(
 )
 PASTA_PROCESSED = PASTA_PROJETO / "processed"
 
-ARQUIVO_BOOKS = (
+ARQUIVO_BOOKS_OPENLIBRARY = (
     PASTA_PROCESSED
-    / "goodreads_books_enriquecido_100k.parquet"
+    / "goodreads_books_openlibrary_100k.parquet"
+)
+
+ARQUIVO_BOOKS_GOOGLE = (
+    PASTA_PROCESSED
+    / "goodreads_books_google_books_100k.parquet"
 )
 
 ARQUIVO_REVIEWS = (
     PASTA_PROCESSED
-    / "goodreads_reviews_enriquecidas_100k.parquet"
+    / "goodreads_reviews_100k.parquet"
 )
 
 ARQUIVO_BOOKS_SAIDA = (
@@ -361,6 +366,12 @@ def validar_livro(
         and ol_isbn13 == gb_isbn13
     )
 
+    fontes_mesmo_isbn10 = (
+        bool(ol_isbn10)
+        and bool(gb_isbn10)
+        and ol_isbn10 == gb_isbn10
+    )
+
     autores_coincidem = (
         autores_têm_interseção(
             ol_authors,
@@ -494,7 +505,10 @@ def validar_livro(
         and title_sim_cross < 0.65
     )
 
-    if conflito_fontes:
+    if conflito_fontes and not (
+        fontes_mesmo_isbn13
+        or fontes_mesmo_isbn10
+    ):
         status = "REJEITAR"
 
     return {
@@ -515,6 +529,7 @@ def validar_livro(
         "isbn10_match_openlibrary": isbn10_ol,
         "isbn10_match_google": isbn10_google,
         "same_isbn13_between_apis": fontes_mesmo_isbn13,
+        "same_isbn10_between_apis": fontes_mesmo_isbn10,
         "authors_match_between_apis": autores_coincidem,
         "year_match_openlibrary": ano_ol_ok,
         "year_match_google": ano_google_ok,
@@ -773,20 +788,45 @@ def main() -> None:
     )
     print("=" * 70)
 
-    if not ARQUIVO_BOOKS.exists():
+    if not ARQUIVO_BOOKS_OPENLIBRARY.exists():
         raise FileNotFoundError(
-            f"Execute primeiro o 03_cruzar_api.py.\n"
-            f"Arquivo ausente: {ARQUIVO_BOOKS}"
+            f"Execute primeiro o 03_cruzar_openlibrary.py.\n"
+            f"Arquivo ausente: {ARQUIVO_BOOKS_OPENLIBRARY}"
+        )
+
+    if not ARQUIVO_BOOKS_GOOGLE.exists():
+        raise FileNotFoundError(
+            f"Execute primeiro o 04_cruzar_google_books.py.\n"
+            f"Arquivo ausente: {ARQUIVO_BOOKS_GOOGLE}"
         )
 
     if not ARQUIVO_REVIEWS.exists():
         raise FileNotFoundError(
-            f"Execute primeiro o 03_cruzar_api.py.\n"
+            f"Execute primeiro o 03_cruzar_openlibrary.py e o 04_cruzar_google_books.py.\n"
             f"Arquivo ausente: {ARQUIVO_REVIEWS}"
         )
 
-    livros = pd.read_parquet(
-        ARQUIVO_BOOKS
+    livros_openlibrary = pd.read_parquet(
+        ARQUIVO_BOOKS_OPENLIBRARY
+    )
+
+    livros_google = pd.read_parquet(
+        ARQUIVO_BOOKS_GOOGLE
+    )
+
+    colunas_google = [
+        coluna
+        for coluna in livros_google.columns
+        if coluna.startswith("google_")
+    ]
+
+    livros = livros_openlibrary.merge(
+        livros_google[
+            ["book_id", *colunas_google]
+        ],
+        on="book_id",
+        how="left",
+        validate="one_to_one",
     )
 
     reviews = pd.read_parquet(
@@ -901,7 +941,35 @@ def main() -> None:
     # Salvar reviews
     # --------------------------------------------------------
 
-    reviews_final = reviews.copy()
+    colunas_livro_reviews = [
+        coluna
+        for coluna in livros_final.columns
+        if coluna.startswith("openlibrary_")
+        or coluna.startswith("google_")
+        or coluna in {
+            "title_similarity_openlibrary",
+            "title_similarity_google",
+            "title_similarity_between_apis",
+            "isbn13_match_openlibrary",
+            "isbn13_match_google",
+            "isbn10_match_openlibrary",
+            "isbn10_match_google",
+            "same_isbn13_between_apis",
+            "authors_match_between_apis",
+            "year_match_openlibrary",
+            "year_match_google",
+            "match_score",
+        }
+    ]
+
+    reviews_final = reviews.merge(
+        livros_final[
+            ["book_id", *colunas_livro_reviews]
+        ],
+        on="book_id",
+        how="left",
+        validate="many_to_one",
+    )
 
     reviews_final[
         "match_status"
