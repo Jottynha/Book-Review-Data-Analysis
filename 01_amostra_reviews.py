@@ -2,28 +2,40 @@ import gzip
 import json
 import random
 import os
+import sys
+from pathlib import Path
 import pandas as pd
 
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
 
 # ============================================================
 # CONFIGURAÇÃO
 # ============================================================
 
+BASE_DIR = Path(__file__).resolve().parent
+
 # Arquivo original dos reviews
-ARQUIVO_REVIEWS = (
+ARQUIVO_REVIEWS = os.getenv(
+    "ARQUIVO_REVIEWS",
     "/media/joao/8cb5cf8c-261d-4ef9-965c-485a78e63f21/kaggle/"
     "goodreads_reviews_dedup.json.gz"
 )
 
 # Arquivo original dos livros
-ARQUIVO_BOOKS = (
+ARQUIVO_BOOKS = os.getenv(
+    "ARQUIVO_BOOKS",
     "/media/joao/8cb5cf8c-261d-4ef9-965c-485a78e63f21/kaggle/"
     "goodreads_books.json.gz"
 )
 
-# Pasta do projeto
-PASTA_PROJETO = (
-    "/home/joao/Projetos/Book-Review-Data-Analysis"
+# Pasta do projeto (compatível com Linux e Windows)
+PASTA_PROJETO = os.getenv(
+    "PASTA_PROJETO",
+    str(BASE_DIR)
 )
 
 PASTA_PROCESSED = os.path.join(

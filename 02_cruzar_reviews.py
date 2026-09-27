@@ -1,13 +1,23 @@
 import os
+import sys
+from pathlib import Path
 import pandas as pd
 
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
 
 # ============================================================
 # CONFIGURAÇÃO
 # ============================================================
 
-PASTA_PROJETO = (
-    "/home/joao/Projetos/Book-Review-Data-Analysis"
+BASE_DIR = Path(__file__).resolve().parent
+
+PASTA_PROJETO = os.getenv(
+    "PASTA_PROJETO",
+    str(BASE_DIR)
 )
 
 PASTA_PROCESSED = os.path.join(

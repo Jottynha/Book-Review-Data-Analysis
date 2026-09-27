@@ -1,0 +1,27 @@
+{
+  "total_livros": 8916,
+  "total_reviews": 10000,
+  "google_books": {
+    "matches": 4424,
+    "cobertura_percentual": 49.62
+  },
+  "open_library": {
+    "matches": 7654,
+    "cobertura_percentual": 85.85
+  },
+  "fontes": {
+    "ambas": 3852,
+    "nenhuma": 690,
+    "somente_google": 572,
+    "somente_openlibrary": 3802
+  },
+  "qualidade_matches": {
+    "muito_alto": 4981,
+    "alto": 1723,
+    "medio": 327,
+    "baixo": 128,
+    "rejeitar": 1067,
+    "sem_match": 690
+  },
+  "livros_prontos_para_eda": 7031
+}
