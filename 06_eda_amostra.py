@@ -17,20 +17,32 @@ ARQUIVO_REVIEWS = PASTA_PROCESSED / "goodreads_reviews_validated_100k.parquet"
 PASTA_SAIDA = PASTA_PROCESSED / "eda_amostra"
 
 STATUS_CONFIAVEIS = ["MUITO_ALTO", "ALTO", "MEDIO"]
-SHELVES_NAO_GENERO = {
+SHELVES_STATUS = {
     "to-read",
     "currently-reading",
     "owned",
     "books-i-own",
-    "favorites",
-    "ebook",
-    "ebooks",
-    "kindle",
-    "audiobook",
-    "audio",
-    "library",
-    "books-about-books",
+    "owned-books",
+    "to-buy",
+    "wish-list",
+    "dnf",
+    "did-not-finish",
+    "maybe",
+    "abandoned",
+    "borrowed",
+    "reviewed",
+    "tbr",
+    "have",
+    "i-own",
+    "own-it",
+    "my-library",
     "my-books",
+    "library",
+    "library-books",
+    "read",
+    "re-read",
+    "read-in-2012",
+    "read-in-2013",
     "read-in-2014",
     "read-in-2015",
     "read-in-2016",
@@ -44,6 +56,43 @@ SHELVES_NAO_GENERO = {
     "read-in-2024",
     "read-in-2025",
     "read-in-2026",
+    "read-2012",
+    "read-2013",
+    "read-2014",
+    "read-2015",
+    "read-2016",
+    "read-2017",
+}
+SHELVES_FORMATO = {
+    "ebook",
+    "ebooks",
+    "kindle",
+    "audiobook",
+    "audiobooks",
+    "audio",
+    "audio-books",
+    "audio-book",
+    "audible",
+    "e-book",
+    "e-books",
+}
+SHELVES_OUTROS = {
+    "favorites",
+    "favourites",
+    "favorite",
+    "favorite-books",
+    "default",
+    "books",
+    "books-about-books",
+    "series",
+    "book-club",
+    "5-stars",
+    "4-stars",
+    "3-stars",
+    "2-stars",
+    "1-star",
+    "english",
+    "arc",
 }
 
 
@@ -103,6 +152,35 @@ def salvar_csv(dataframe: pd.DataFrame, nome: str) -> None:
     dataframe.to_csv(PASTA_SAIDA / nome, index=False, encoding="utf-8")
 
 
+def classificar_shelf(shelf: str) -> str:
+    shelf_normalizada = shelf.lower()
+    if (
+        shelf_normalizada in SHELVES_STATUS
+        or shelf_normalizada.startswith("read-in-")
+        or shelf_normalizada.startswith("read-")
+        or "to-read" in shelf_normalizada
+        or "owned" in shelf_normalizada
+    ):
+        return "status_leitura"
+    if (
+        shelf_normalizada in SHELVES_FORMATO
+        or "kindle" in shelf_normalizada
+        or "ebook" in shelf_normalizada
+        or "e-book" in shelf_normalizada
+        or "audio" in shelf_normalizada
+        or "audible" in shelf_normalizada
+    ):
+        return "formato"
+    if (
+        shelf_normalizada in SHELVES_OUTROS
+        or "favorite" in shelf_normalizada
+        or "favourite" in shelf_normalizada
+        or "-stars" in shelf_normalizada
+    ):
+        return "outro"
+    return "genre_proxy"
+
+
 def contar_shelves(books: pd.DataFrame) -> pd.DataFrame:
     shelves = (
         books[["book_id", "popular_shelves"]]
@@ -114,7 +192,8 @@ def contar_shelves(books: pd.DataFrame) -> pd.DataFrame:
     shelves["shelf"] = shelves["shelf"].fillna("").astype(str).str.strip()
     shelves = shelves[shelves["shelf"].ne("")]
     shelves = shelves.drop_duplicates(["book_id", "shelf"])
-    shelves["is_genre_proxy"] = ~shelves["shelf"].str.lower().isin(SHELVES_NAO_GENERO)
+    shelves["shelf_type"] = shelves["shelf"].map(classificar_shelf)
+    shelves["is_genre_proxy"] = shelves["shelf_type"].eq("genre_proxy")
     return shelves
 
 
@@ -195,7 +274,7 @@ def gerar_relatorio(
     reviews_por_livro = reviews.groupby("book_id").size()
     reviews_por_usuario = reviews.groupby("user_id").size()
     genre_shelves = shelves[shelves["is_genre_proxy"]]
-    top_genres = genre_shelves["shelf"].value_counts().head(20)
+    shelf_type_counts = shelves["shelf_type"].value_counts()
 
     linhas = [
         "# EDA inicial da amostra",
@@ -232,10 +311,14 @@ def gerar_relatorio(
         "",
         "## Gêneros e shelves",
         "",
-        "As `popular_shelves` são usadas como proxy exploratório de gênero. Elas são",
-        "rótulos sociais dos usuários, podem se sobrepor e também incluem status de",
-        "leitura; por isso não devem ser interpretadas como uma classificação editorial",
-        "exclusiva. Os status e formatos mais óbvios foram removidos da tabela de proxy.",
+        "As `popular_shelves` são rótulos sociais e podem se sobrepor. Nesta EDA,",
+        "cada shelf é classificada como `genre_proxy`, `status_leitura`, `formato`",
+        "ou `outro`. Apenas `genre_proxy` é usado na tabela de gêneros; a classificação",
+        "é exploratória e não equivale a uma taxonomia editorial definitiva.",
+        "",
+        f"- Associações livro-shelf classificadas como proxy de gênero: {int(shelf_type_counts.get('genre_proxy', 0)):,}",
+        f"- Associações livro-shelf classificadas como status de leitura: {int(shelf_type_counts.get('status_leitura', 0)):,}",
+        f"- Associações livro-shelf classificadas como formato: {int(shelf_type_counts.get('formato', 0)):,}",
         "",
         "## Artefatos",
         "",
@@ -243,7 +326,9 @@ def gerar_relatorio(
         "- `distribuicao_notas.csv`: frequência e percentual de cada nota.",
         "- `top_usuarios.csv`: usuários com mais reviews na amostra.",
         "- `top_livros.csv`: livros com mais reviews e nota média.",
-        "- `top_shelves.csv` e `top_generos_proxy.csv`: rótulos mais frequentes.",
+        "- `top_shelves.csv`: todos os rótulos, com seu tipo de classificação.",
+        "- `top_generos_proxy.csv`: somente rótulos classificados como gênero.",
+        "- `shelves_por_tipo.csv`: quantidade de shelves por categoria.",
         "- `01_` a `05_*.png`: gráficos para inspeção inicial.",
         "",
         "## Perguntas para a próxima análise",
@@ -278,8 +363,20 @@ def gerar_relatorio(
     ).sort_values(["reviews", "nota_media"], ascending=False).head(30).reset_index()
     salvar_csv(top_books, "top_livros.csv")
     salvar_csv(
-        shelves["shelf"].value_counts().head(50).rename("livros").rename_axis("shelf").reset_index(),
+        shelves.groupby(["shelf", "shelf_type"])
+        .size()
+        .sort_values(ascending=False)
+        .head(50)
+        .rename("livros")
+        .reset_index(),
         "top_shelves.csv",
+    )
+    salvar_csv(
+        shelves.groupby("shelf_type").agg(
+            associacoes=("shelf", "size"),
+            shelves_unicas=("shelf", "nunique"),
+        ).reset_index(),
+        "shelves_por_tipo.csv",
     )
     salvar_csv(
         genre_shelves["shelf"].value_counts().head(50).rename("livros").rename_axis("shelf").reset_index(),

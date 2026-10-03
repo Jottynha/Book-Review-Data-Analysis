@@ -32,10 +32,14 @@ Filtro aplicado: somente matches confiáveis.
 
 ## Gêneros e shelves
 
-As `popular_shelves` são usadas como proxy exploratório de gênero. Elas são
-rótulos sociais dos usuários, podem se sobrepor e também incluem status de
-leitura; por isso não devem ser interpretadas como uma classificação editorial
-exclusiva. Os status e formatos mais óbvios foram removidos da tabela de proxy.
+As `popular_shelves` são rótulos sociais e podem se sobrepor. Nesta EDA,
+cada shelf é classificada como `genre_proxy`, `status_leitura`, `formato`
+ou `outro`. Apenas `genre_proxy` é usado na tabela de gêneros; a classificação
+é exploratória e não equivale a uma taxonomia editorial definitiva.
+
+- Associações livro-shelf classificadas como proxy de gênero: 538,835
+- Associações livro-shelf classificadas como status de leitura: 148,726
+- Associações livro-shelf classificadas como formato: 61,766
 
 ## Artefatos
 
@@ -43,7 +47,9 @@ exclusiva. Os status e formatos mais óbvios foram removidos da tabela de proxy.
 - `distribuicao_notas.csv`: frequência e percentual de cada nota.
 - `top_usuarios.csv`: usuários com mais reviews na amostra.
 - `top_livros.csv`: livros com mais reviews e nota média.
-- `top_shelves.csv` e `top_generos_proxy.csv`: rótulos mais frequentes.
+- `top_shelves.csv`: todos os rótulos, com seu tipo de classificação.
+- `top_generos_proxy.csv`: somente rótulos classificados como gênero.
+- `shelves_por_tipo.csv`: quantidade de shelves por categoria.
 - `01_` a `05_*.png`: gráficos para inspeção inicial.
 
 ## Perguntas para a próxima análise
