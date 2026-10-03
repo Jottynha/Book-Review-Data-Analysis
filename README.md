@@ -189,6 +189,8 @@ df = df[
             -> goodreads_books_validated_100k.parquet
             -> goodreads_reviews_validated_100k.parquet
             -> relatório de qualidade e fila de revisão
+    06_eda_amostra.py
+        -> processed/eda_amostra/
     ```
 
     O `02_cruzar_reviews.py` usa `left join` por `book_id` para manter as resenhas
@@ -230,6 +232,42 @@ df = df[
 
     Para a etapa do Google Books, configure `GOOGLE_BOOKS_API_KEY` no ambiente ou em
     `.env`. As etapas externas reaproveitam os caches persistidos em `processed/`.
+
+    ## EDA inicial da amostra
+
+    O script `06_eda_amostra.py` inaugura a etapa de análise exploratória. Ele lê as
+    bases validadas e gera em `processed/eda_amostra/` um relatório Markdown, tabelas
+    CSV e gráficos PNG sobre:
+
+    - perfil da amostra, livros únicos e concentração de reviews por livro;
+    - usuários únicos e concentração de reviews por usuário;
+    - distribuição das notas, incluindo a proporção de `rating == 0`;
+    - tamanho das reviews, votos de utilidade e comentários;
+    - livros mais resenhados e relação entre volume de reviews e nota média;
+    - idiomas, páginas, formato e proporção de ebooks;
+    - `popular_shelves` e gêneros aproximados.
+
+    Execute:
+
+    ```bash
+    python3 06_eda_amostra.py
+    ```
+
+    Por padrão, a EDA usa todas as reviews da amostra para descrever a seleção
+    observada. Para uma leitura mais conservadora, restrita aos livros com
+    `match_status` `MUITO_ALTO`, `ALTO` ou `MEDIO`, execute:
+
+    ```bash
+    python3 06_eda_amostra.py --only-confident
+    ```
+
+    O segundo comando grava em `processed/eda_amostra_confiante/`, sem sobrescrever
+    os resultados da amostra completa.
+
+    As `popular_shelves` são rótulos sociais e podem misturar gênero, status de
+    leitura, formato e outros interesses. Por isso, `top_generos_proxy.csv` é um
+    indicador exploratório, não uma classificação editorial definitiva. As relações
+    observadas na EDA são descritivas e não demonstram causalidade.
 
     ## Próxima etapa: análises
 
